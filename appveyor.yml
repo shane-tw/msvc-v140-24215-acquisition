@@ -10,6 +10,7 @@ environment:
   EXPECTED_MSVC_BANNER: 19.00.24215.1
   EXPECTED_VC_VSU3_MSP_SHA1: 0635238754D5A8C38FE9BAF41296C1E0C8DA49B1
   EXPECTED_VC_VSU3_MSP_SIZE: 75481088
+  APPVEYOR_ARTIFACT_UPLOAD_TIMEOUT: 600
 
 build_script:
   - ps: |
@@ -30,36 +31,48 @@ build_script:
         )
 
         if (-not (Test-Path -LiteralPath $Compiler -PathType Leaf)) {
-          throw "Missing $Label compiler: $Compiler"
+          return [pscustomobject]@{
+            label = $Label; path = $Compiler; status = 'missing'; error = 'compiler path absent'
+            banner_version = $null; target = $null; expected_version = $env:EXPECTED_MSVC_BANNER
+            expected_version_match = $false; size = $null; sha256 = $null
+            file_version = $null; product_version = $null; signature_status = $null; signer = $null
+          }
         }
 
-        # cl.exe writes its banner to stderr and exits non-zero with no input.
-        # Redirect inside cmd.exe so ErrorActionPreference cannot hide it.
-        $commandLine = ('""{0}" 2>&1"' -f $Compiler)
-        $banner = (& cmd.exe /d /s /c $commandLine | Out-String).Trim()
-        $banner | Set-Content -LiteralPath (Join-Path $metadataRoot "$Label-banner.txt") -Encoding ASCII
-
-        $match = [regex]::Match($banner, 'Version\s+([0-9.]+)\s+for\s+([^\s]+)')
-        if (-not $match.Success) {
-          throw "Could not parse $Label compiler banner: $banner"
+        $stdoutPath = Join-Path $metadataRoot "$Label-cl-stdout.txt"
+        $stderrPath = Join-Path $metadataRoot "$Label-cl-stderr.txt"
+        try {
+          $process = Start-Process -FilePath $Compiler -ArgumentList '/?' -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+          $banner = ((Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) + "`n" +
+            (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue)).Trim()
+          $banner | Set-Content -LiteralPath (Join-Path $metadataRoot "$Label-banner.txt") -Encoding ASCII
+          $match = [regex]::Match($banner, 'Version\s+([0-9.]+)\s+for\s+([^\s]+)')
+          $item = Get-Item -LiteralPath $Compiler
+          $signature = Get-AuthenticodeSignature -LiteralPath $Compiler
+          return [pscustomobject]@{
+            label = $Label; path = $Compiler; status = if ($match.Success) { 'parsed' } else { 'unparsed' }
+            error = if ($match.Success) { $null } else { 'compiler banner regex did not match' }
+            exit_code = $process.ExitCode
+            banner_version = if ($match.Success) { $match.Groups[1].Value } else { $null }
+            target = if ($match.Success) { $match.Groups[2].Value } else { $null }
+            expected_version = $env:EXPECTED_MSVC_BANNER
+            expected_version_match = ($match.Success -and $match.Groups[1].Value -eq $env:EXPECTED_MSVC_BANNER)
+            size = $item.Length
+            sha256 = (Get-FileHash -LiteralPath $Compiler -Algorithm SHA256).Hash.ToLowerInvariant()
+            file_version = $item.VersionInfo.FileVersion
+            product_version = $item.VersionInfo.ProductVersion
+            signature_status = $signature.Status.ToString()
+            signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { $null }
+          }
         }
-
-        $item = Get-Item -LiteralPath $Compiler
-        $sha256 = (Get-FileHash -LiteralPath $Compiler -Algorithm SHA256).Hash.ToLowerInvariant()
-        $signature = Get-AuthenticodeSignature -LiteralPath $Compiler
-        [pscustomobject]@{
-          label = $Label
-          path = $Compiler
-          banner_version = $match.Groups[1].Value
-          target = $match.Groups[2].Value
-          expected_version = $env:EXPECTED_MSVC_BANNER
-          expected_version_match = ($match.Groups[1].Value -eq $env:EXPECTED_MSVC_BANNER)
-          size = $item.Length
-          sha256 = $sha256
-          file_version = $item.VersionInfo.FileVersion
-          product_version = $item.VersionInfo.ProductVersion
-          signature_status = $signature.Status.ToString()
-          signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { $null }
+        catch {
+          return [pscustomobject]@{
+            label = $Label; path = $Compiler; status = 'error'; error = $_.Exception.Message
+            banner_version = $null; target = $null; expected_version = $env:EXPECTED_MSVC_BANNER
+            expected_version_match = $false; size = $null; sha256 = $null
+            file_version = $null; product_version = $null; signature_status = $null; signer = $null
+          }
         }
       }
 
@@ -104,42 +117,62 @@ build_script:
       $expectedSize = [int64]$env:EXPECTED_VC_VSU3_MSP_SIZE
       $mspRows = New-Object 'System.Collections.Generic.List[object]'
       $selectedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+      $scanComplete = $false
+      $scanError = $null
+      $discoveredCount = 0
+      $hashedCount = 0
+      $selectedBytes = [int64]0
+      $selectedByteCap = [int64](256MB)
       if (Test-Path -LiteralPath $packageCacheRoot -PathType Container) {
-        Get-ChildItem -LiteralPath $packageCacheRoot -Recurse -File -Filter '*.msp' -ErrorAction SilentlyContinue |
-          Sort-Object FullName |
-          ForEach-Object {
-            $sha1 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA1).Hash.ToUpperInvariant()
-            $sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        try {
+          $mspFiles = @(Get-ChildItem -LiteralPath $packageCacheRoot -Recurse -Force -File -Filter '*.msp' -ErrorAction Stop |
+            Sort-Object FullName)
+          $discoveredCount = $mspFiles.Count
+          foreach ($mspFile in $mspFiles) {
+            $sha1 = (Get-FileHash -LiteralPath $mspFile.FullName -Algorithm SHA1).Hash.ToUpperInvariant()
+            $sha256 = (Get-FileHash -LiteralPath $mspFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $hashedCount++
             $exactHash = ($sha1 -eq $expectedSha1)
-            $exactSize = ($_.Length -eq $expectedSize)
-            $namedCandidate = ($_.FullName -match '(?i)VC[_-]?VSU3|KB3165756|14[.]0[.](24215|25425)')
-            $selected = $exactHash -or $namedCandidate
+            $exactSize = ($mspFile.Length -eq $expectedSize)
+            $namedCandidate = ($mspFile.FullName -match '(?i)VC[_-]?VSU3|KB3165756|14[.]0[.](24215|25425)')
+            $selected = ($exactHash -and $exactSize) -or $namedCandidate
+            $copyOmittedByCap = ($selected -and ($selectedBytes + $mspFile.Length -gt $selectedByteCap))
             $mspRows.Add([pscustomobject]@{
-              path = $_.FullName
-              size = $_.Length
+              path = $mspFile.FullName
+              size = $mspFile.Length
               sha1 = $sha1
               sha256 = $sha256
               expected_sha1_match = $exactHash
               expected_size_match = $exactSize
               named_candidate = $namedCandidate
               selected = $selected
+              copy_omitted_by_cap = $copyOmittedByCap
             })
-            if ($selected) {
-              [void]$selectedPaths.Add($_.FullName)
-              Copy-PackageCacheFile -Source $_.FullName
-              Get-ChildItem -LiteralPath $_.DirectoryName -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -lt 50MB -and $_.Extension -match '(?i)^\.(xml|json|manifest|txt|ini|rsm)$' } |
+            if ($selected -and -not $copyOmittedByCap) {
+              $selectedBytes += $mspFile.Length
+              [void]$selectedPaths.Add($mspFile.FullName)
+              Copy-PackageCacheFile -Source $mspFile.FullName
+              Get-ChildItem -LiteralPath $mspFile.DirectoryName -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Length -lt 4MB -and $_.Extension -match '(?i)^\.(xml|json|manifest|txt|ini|rsm)$' } |
                 ForEach-Object {
-                  [void]$selectedPaths.Add($_.FullName)
-                  Copy-PackageCacheFile -Source $_.FullName
+                  if ($selectedBytes + $_.Length -le $selectedByteCap) {
+                    $selectedBytes += $_.Length
+                    [void]$selectedPaths.Add($_.FullName)
+                    Copy-PackageCacheFile -Source $_.FullName
+                  }
                 }
             }
           }
+          $scanComplete = $true
+        }
+        catch {
+          $scanError = $_.Exception.Message
+        }
       }
       $mspRows | ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath (Join-Path $metadataRoot 'package-cache-msp.json') -Encoding UTF8
 
-      $exactMatches = @($mspRows | Where-Object { $_.expected_sha1_match })
+      $exactMatches = @($mspRows | Where-Object { $_.expected_sha1_match -and $_.expected_size_match })
       $namedMatches = @($mspRows | Where-Object { $_.named_candidate })
       [pscustomobject]@{
         expected_sha1 = $expectedSha1
@@ -148,8 +181,14 @@ build_script:
         expected_payload_count = $exactMatches.Count
         expected_payload_size_valid = ($exactMatches.Count -gt 0 -and @($exactMatches | Where-Object { -not $_.expected_size_match }).Count -eq 0)
         named_candidate_count = $namedMatches.Count
+        scan_complete = $scanComplete
+        scan_error = $scanError
+        discovered_msp_count = $discoveredCount
+        hashed_msp_count = $hashedCount
         total_msp_count = $mspRows.Count
         selected_file_count = $selectedPaths.Count
+        selected_total_bytes = $selectedBytes
+        selected_byte_cap = $selectedByteCap
         installed_compiler_is_expected = (@($compilerIdentities | Where-Object { -not $_.expected_version_match }).Count -eq 0)
       } | ConvertTo-Json |
         Set-Content -LiteralPath (Join-Path $metadataRoot 'RESULT.json') -Encoding UTF8
