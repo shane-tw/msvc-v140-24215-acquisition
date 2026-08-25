@@ -31,35 +31,6 @@ internal static class ExtractOleStream
             uint reserved2,
             [MarshalAs(UnmanagedType.Interface)] out IStream stream);
 
-        void CreateStorage(
-            [MarshalAs(UnmanagedType.LPWStr)] string name,
-            uint mode,
-            uint reserved1,
-            uint reserved2,
-            [MarshalAs(UnmanagedType.Interface)] out CompoundIStorage storage);
-
-        void OpenStorage(
-            [MarshalAs(UnmanagedType.LPWStr)] string name,
-            IntPtr priority,
-            uint mode,
-            IntPtr exclude,
-            uint reserved,
-            [MarshalAs(UnmanagedType.Interface)] out CompoundIStorage storage);
-
-        void CopyTo(uint count, IntPtr exclusions, IntPtr names, CompoundIStorage destination);
-        void MoveElementTo([MarshalAs(UnmanagedType.LPWStr)] string name, CompoundIStorage destination,
-            [MarshalAs(UnmanagedType.LPWStr)] string newName, uint flags);
-        void Commit(uint flags);
-        void Revert();
-        void EnumElements(uint reserved1, IntPtr reserved2, uint reserved3, out IEnumSTATSTG enumerator);
-        void DestroyElement([MarshalAs(UnmanagedType.LPWStr)] string name);
-        void RenameElement([MarshalAs(UnmanagedType.LPWStr)] string oldName,
-            [MarshalAs(UnmanagedType.LPWStr)] string newName);
-        void SetElementTimes([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr creation,
-            IntPtr access, IntPtr modification);
-        void SetClass(ref Guid classId);
-        void SetStateBits(uint stateBits, uint mask);
-        void Stat(out STATSTG stat, uint flags);
     }
 
     [DllImport("ole32.dll", CharSet = CharSet.Unicode)]
