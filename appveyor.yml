@@ -1,7 +1,5 @@
-version: "v140-24215-{build}"
+version: "v140-msp-probe-{build}"
 
-# This job is an acquisition probe, not a project build.  The legacy image is
-# the one public AppVeyor logs identify as MSVC 19.00.24215.1.
 image: Visual Studio 2015
 clone_depth: 1
 skip_tags: true
@@ -10,8 +8,8 @@ deploy: off
 
 environment:
   EXPECTED_MSVC_BANNER: 19.00.24215.1
-  EXPECTED_CHROMIUM_AMD64_CL_SHA256: 7928c17d5185cf7dca794e9970e2463985315adf832f3fde7becfc71673d2fd3
   EXPECTED_VC_VSU3_MSP_SHA1: 0635238754D5A8C38FE9BAF41296C1E0C8DA49B1
+  EXPECTED_VC_VSU3_MSP_SIZE: 75481088
 
 build_script:
   - ps: |
@@ -22,50 +20,10 @@ build_script:
       $captureRoot = Join-Path $buildRoot 'capture-root'
       $metadataRoot = Join-Path $buildRoot 'capture-metadata'
       $vcRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio 14.0\VC'
-      $vsRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio 14.0'
-      $kits10Root = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
-      $kits81Root = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\8.1'
       $packageCacheRoot = 'C:\ProgramData\Package Cache'
-
       New-Item -ItemType Directory -Force -Path $captureRoot, $metadataRoot | Out-Null
 
-      function Copy-TreeChecked {
-        param(
-          [Parameter(Mandatory = $true)][string]$Source,
-          [Parameter(Mandatory = $true)][string]$Destination
-        )
-
-        if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
-          return $false
-        }
-
-        New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-        & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
-        $robocopyExit = $LASTEXITCODE
-        if ($robocopyExit -ge 8) {
-          throw "robocopy failed with exit code $robocopyExit while copying $Source"
-        }
-        return $true
-      }
-
-      function Copy-FilePreservingTree {
-        param(
-          [Parameter(Mandatory = $true)][string]$Source,
-          [Parameter(Mandatory = $true)][string]$SourceRoot,
-          [Parameter(Mandatory = $true)][string]$DestinationRoot
-        )
-
-        $sourcePrefix = $SourceRoot.TrimEnd('\') + '\'
-        if (-not $Source.StartsWith($sourcePrefix, [StringComparison]::OrdinalIgnoreCase)) {
-          throw "Source path is outside its declared root: $Source"
-        }
-        $relative = $Source.Substring($sourcePrefix.Length)
-        $destination = Join-Path $DestinationRoot $relative
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-        Copy-Item -LiteralPath $Source -Destination $destination -Force
-      }
-
-      function Get-CompilerBanner {
+      function Get-CompilerIdentity {
         param(
           [Parameter(Mandatory = $true)][string]$Compiler,
           [Parameter(Mandatory = $true)][string]$Label
@@ -74,15 +32,35 @@ build_script:
         if (-not (Test-Path -LiteralPath $Compiler -PathType Leaf)) {
           throw "Missing $Label compiler: $Compiler"
         }
-        $banner = (& $Compiler 2>&1 | Out-String)
-        $banner | Set-Content -LiteralPath (Join-Path $metadataRoot "$Label-banner.txt") -Encoding ASCII
-        if ($banner -notmatch [regex]::Escape($env:EXPECTED_MSVC_BANNER)) {
-          throw "$Label compiler is not MSVC $($env:EXPECTED_MSVC_BANNER): $banner"
-        }
-      }
 
-      if (-not (Test-Path -LiteralPath $vcRoot -PathType Container)) {
-        throw "Visual C++ 14.0 root is absent: $vcRoot"
+        # cl.exe writes its banner to stderr and exits non-zero with no input.
+        # Redirect inside cmd.exe so ErrorActionPreference cannot hide it.
+        $commandLine = ('""{0}" 2>&1"' -f $Compiler)
+        $banner = (& cmd.exe /d /s /c $commandLine | Out-String).Trim()
+        $banner | Set-Content -LiteralPath (Join-Path $metadataRoot "$Label-banner.txt") -Encoding ASCII
+
+        $match = [regex]::Match($banner, 'Version\s+([0-9.]+)\s+for\s+([^\s]+)')
+        if (-not $match.Success) {
+          throw "Could not parse $Label compiler banner: $banner"
+        }
+
+        $item = Get-Item -LiteralPath $Compiler
+        $sha256 = (Get-FileHash -LiteralPath $Compiler -Algorithm SHA256).Hash.ToLowerInvariant()
+        $signature = Get-AuthenticodeSignature -LiteralPath $Compiler
+        [pscustomobject]@{
+          label = $Label
+          path = $Compiler
+          banner_version = $match.Groups[1].Value
+          target = $match.Groups[2].Value
+          expected_version = $env:EXPECTED_MSVC_BANNER
+          expected_version_match = ($match.Groups[1].Value -eq $env:EXPECTED_MSVC_BANNER)
+          size = $item.Length
+          sha256 = $sha256
+          file_version = $item.VersionInfo.FileVersion
+          product_version = $item.VersionInfo.ProductVersion
+          signature_status = $signature.Status.ToString()
+          signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { $null }
+        }
       }
 
       $x86Cl = Join-Path $vcRoot 'bin\cl.exe'
@@ -90,223 +68,104 @@ build_script:
       if (-not (Test-Path -LiteralPath $amd64Cl -PathType Leaf)) {
         $amd64Cl = Join-Path $vcRoot 'bin\x86_amd64\cl.exe'
       }
-      Get-CompilerBanner -Compiler $x86Cl -Label 'x86'
-      Get-CompilerBanner -Compiler $amd64Cl -Label 'amd64'
+      $compilerIdentities = @(
+        Get-CompilerIdentity -Compiler $x86Cl -Label 'x86'
+        Get-CompilerIdentity -Compiler $amd64Cl -Label 'amd64'
+      )
+      $compilerIdentities | ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath (Join-Path $metadataRoot 'compiler-identities.json') -Encoding UTF8
 
-      $amd64ClHash = (Get-FileHash -LiteralPath $amd64Cl -Algorithm SHA256).Hash.ToLowerInvariant()
       @(
-        "path`tsha256`texpected_chromium_sha256`tmatch",
-        "$amd64Cl`t$amd64ClHash`t$($env:EXPECTED_CHROMIUM_AMD64_CL_SHA256)`t$($amd64ClHash -eq $env:EXPECTED_CHROMIUM_AMD64_CL_SHA256)"
-      ) | Set-Content -LiteralPath (Join-Path $metadataRoot 'amd64-cl-identity.tsv') -Encoding ASCII
+        "os_version=$([System.Environment]::OSVersion.VersionString)",
+        "is_64_bit_os=$([System.Environment]::Is64BitOperatingSystem)",
+        "powershell_version=$($PSVersionTable.PSVersion.ToString())"
+      ) | Set-Content -LiteralPath (Join-Path $metadataRoot 'worker-os.txt') -Encoding ASCII
+      @(
+        "APPVEYOR_BUILD_WORKER_IMAGE=$env:APPVEYOR_BUILD_WORKER_IMAGE",
+        "APPVEYOR_BUILD_ID=$env:APPVEYOR_BUILD_ID",
+        "APPVEYOR_JOB_ID=$env:APPVEYOR_JOB_ID",
+        "APPVEYOR_BUILD_VERSION=$env:APPVEYOR_BUILD_VERSION",
+        "APPVEYOR_REPO_COMMIT=$env:APPVEYOR_REPO_COMMIT"
+      ) | Set-Content -LiteralPath (Join-Path $metadataRoot 'appveyor-environment.txt') -Encoding ASCII
 
-      # Compile both target architectures before spending time packaging.  /Zi
-      # also proves that the PDB support binaries in this image are usable.
-      $probeSource = Join-Path $metadataRoot 'compiler-probe.cpp'
-      'extern "C" int compiler_probe(int x) { return x * 3 + 7; }' |
-        Set-Content -LiteralPath $probeSource -Encoding ASCII
-      foreach ($architecture in @('x86', 'amd64')) {
-        $probeObject = Join-Path $metadataRoot "compiler-probe-$architecture.obj"
-        $probePdb = Join-Path $metadataRoot "compiler-probe-$architecture.pdb"
-        $probeBatch = Join-Path $metadataRoot "compile-probe-$architecture.cmd"
-        @(
-          '@echo off',
-          "call `"$vcRoot\vcvarsall.bat`" $architecture >nul",
-          'if errorlevel 1 exit /b %errorlevel%',
-          "cl /nologo /c /O2 /MT /Zi /Zc:inline /D_ALLOW_RUNTIME_LIBRARY_MISMATCH /Fo`"$probeObject`" /Fd`"$probePdb`" `"$probeSource`"",
-          'exit /b %errorlevel%'
-        ) | Set-Content -LiteralPath $probeBatch -Encoding ASCII
-        & cmd.exe /d /c $probeBatch
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $probeObject -PathType Leaf)) {
-          throw "$architecture compiler probe failed with exit code $LASTEXITCODE"
+      function Copy-PackageCacheFile {
+        param([Parameter(Mandatory = $true)][string]$Source)
+        $cachePrefix = $packageCacheRoot.TrimEnd('\') + '\'
+        if (-not $Source.StartsWith($cachePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+          throw "Package Cache path escaped its root: $Source"
         }
+        $relative = $Source.Substring($cachePrefix.Length)
+        $destination = Join-Path (Join-Path $captureRoot 'PackageCache') $relative
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+        Copy-Item -LiteralPath $Source -Destination $destination -Force
       }
 
-      # Preserve the complete compiler/CRT tree.  This carries the native and
-      # cross-hosted x86/x64 frontends, C2, linker, librarian, headers, libs,
-      # redists, and their ordinary directory relationships.
-      Copy-TreeChecked -Source $vcRoot -Destination (Join-Path $captureRoot 'VS14\VC') | Out-Null
-
-      # PDB support is partly outside VC\bin on VS2015.
-      $ideRoot = Join-Path $vsRoot 'Common7\IDE'
-      $ideDestination = Join-Path $captureRoot 'VS14\Common7\IDE'
-      foreach ($pattern in @('mspdb*.dll', 'mspdbsrv.exe', 'mspdbcore.dll', 'msobj140.dll')) {
-        Get-ChildItem -LiteralPath $ideRoot -Filter $pattern -File -ErrorAction SilentlyContinue |
-          ForEach-Object {
-            New-Item -ItemType Directory -Force -Path $ideDestination | Out-Null
-            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $ideDestination $_.Name) -Force
-          }
-      }
-
-      # Capture only SDK revisions relevant to the Valve archive lineage.  The
-      # metadata inventories every installed revision even when 10240 is not on
-      # the current image.
-      $installedKitVersions = @()
-      $kits10IncludeRoot = Join-Path $kits10Root 'Include'
-      if (Test-Path -LiteralPath $kits10IncludeRoot -PathType Container) {
-        $installedKitVersions = Get-ChildItem -LiteralPath $kits10IncludeRoot -Directory |
-          Select-Object -ExpandProperty Name | Sort-Object
-      }
-      $installedKitVersions | Set-Content -LiteralPath (Join-Path $metadataRoot 'windows-kits-10-installed.txt') -Encoding ASCII
-
-      foreach ($kitVersion in @('10.0.10240.0', '10.0.10586.0', '10.0.14393.0')) {
-        foreach ($kind in @('Include', 'Lib', 'bin')) {
-          $kitSource = Join-Path (Join-Path $kits10Root $kind) $kitVersion
-          $kitDestination = Join-Path (Join-Path (Join-Path $captureRoot 'WindowsKits\10') $kind) $kitVersion
-          Copy-TreeChecked -Source $kitSource -Destination $kitDestination | Out-Null
-        }
-      }
-      foreach ($architecture in @('x86', 'x64')) {
-        Copy-TreeChecked `
-          -Source (Join-Path (Join-Path $kits10Root 'bin') $architecture) `
-          -Destination (Join-Path (Join-Path $captureRoot 'WindowsKits\10\bin') $architecture) | Out-Null
-        Copy-TreeChecked `
-          -Source (Join-Path $kits10Root "Redist\ucrt\DLLs\$architecture") `
-          -Destination (Join-Path $captureRoot "WindowsKits\10\Redist\ucrt\DLLs\$architecture") | Out-Null
-      }
-
-      Copy-TreeChecked `
-        -Source (Join-Path $kits81Root 'Include') `
-        -Destination (Join-Path $captureRoot 'WindowsKits\8.1\Include') | Out-Null
-      Copy-TreeChecked `
-        -Source (Join-Path $kits81Root 'Lib\winv6.3') `
-        -Destination (Join-Path $captureRoot 'WindowsKits\8.1\Lib\winv6.3') | Out-Null
-      foreach ($architecture in @('x86', 'x64')) {
-        Copy-TreeChecked `
-          -Source (Join-Path $kits81Root "bin\$architecture") `
-          -Destination (Join-Path $captureRoot "WindowsKits\8.1\bin\$architecture") | Out-Null
-      }
-
-      # Hash every cached MSP, because servicing payloads can be stored under a
-      # GUID with a generic filename.  Copy exact VC_VSU3/KB matches and their
-      # small adjacent manifests into the acquisition bundle.
-      $mspInventory = New-Object 'System.Collections.Generic.List[string]'
-      $mspInventory.Add("path`tsize`tsha1`tsha256`tselected")
-      $expectedMspFound = $false
+      $expectedSha1 = $env:EXPECTED_VC_VSU3_MSP_SHA1.ToUpperInvariant()
+      $expectedSize = [int64]$env:EXPECTED_VC_VSU3_MSP_SIZE
+      $mspRows = New-Object 'System.Collections.Generic.List[object]'
+      $selectedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
       if (Test-Path -LiteralPath $packageCacheRoot -PathType Container) {
         Get-ChildItem -LiteralPath $packageCacheRoot -Recurse -File -Filter '*.msp' -ErrorAction SilentlyContinue |
           Sort-Object FullName |
           ForEach-Object {
             $sha1 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA1).Hash.ToUpperInvariant()
             $sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            $selected = ($sha1 -eq $env:EXPECTED_VC_VSU3_MSP_SHA1) -or
-              ($_.FullName -match '(?i)VC[_-]?VSU3|KB3165756|14[.]0[.]24215|14[.]0[.]25425')
-            if ($sha1 -eq $env:EXPECTED_VC_VSU3_MSP_SHA1) {
-              $expectedMspFound = $true
-            }
-            $mspInventory.Add("$($_.FullName)`t$($_.Length)`t$sha1`t$sha256`t$selected")
+            $exactHash = ($sha1 -eq $expectedSha1)
+            $exactSize = ($_.Length -eq $expectedSize)
+            $namedCandidate = ($_.FullName -match '(?i)VC[_-]?VSU3|KB3165756|14[.]0[.](24215|25425)')
+            $selected = $exactHash -or $namedCandidate
+            $mspRows.Add([pscustomobject]@{
+              path = $_.FullName
+              size = $_.Length
+              sha1 = $sha1
+              sha256 = $sha256
+              expected_sha1_match = $exactHash
+              expected_size_match = $exactSize
+              named_candidate = $namedCandidate
+              selected = $selected
+            })
             if ($selected) {
-              Copy-FilePreservingTree `
-                -Source $_.FullName `
-                -SourceRoot $packageCacheRoot `
-                -DestinationRoot (Join-Path $captureRoot 'PackageCache')
+              [void]$selectedPaths.Add($_.FullName)
+              Copy-PackageCacheFile -Source $_.FullName
               Get-ChildItem -LiteralPath $_.DirectoryName -File -ErrorAction SilentlyContinue |
-                Where-Object {
-                  $_.Extension -match '^(?i)[.](xml|json|manifest|txt|ini|rsm)$' -and
-                  $_.Length -lt 50MB
-                } |
+                Where-Object { $_.Length -lt 50MB -and $_.Extension -match '(?i)^\.(xml|json|manifest|txt|ini|rsm)$' } |
                 ForEach-Object {
-                  Copy-FilePreservingTree `
-                    -Source $_.FullName `
-                    -SourceRoot $packageCacheRoot `
-                    -DestinationRoot (Join-Path $captureRoot 'PackageCache')
+                  [void]$selectedPaths.Add($_.FullName)
+                  Copy-PackageCacheFile -Source $_.FullName
                 }
             }
           }
       }
-      $mspInventory | Set-Content -LiteralPath (Join-Path $metadataRoot 'package-cache-msp.tsv') -Encoding ASCII
-      $expectedMspFound.ToString().ToLowerInvariant() |
-        Set-Content -LiteralPath (Join-Path $metadataRoot 'expected-vc-vsu3-msp-found.txt') -Encoding ASCII
+      $mspRows | ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath (Join-Path $metadataRoot 'package-cache-msp.json') -Encoding UTF8
 
-      # Record key tool identities separately for fast review.
-      $keyToolCandidates = @(
-        (Join-Path $vcRoot 'bin\cl.exe'),
-        (Join-Path $vcRoot 'bin\c1.dll'),
-        (Join-Path $vcRoot 'bin\c1xx.dll'),
-        (Join-Path $vcRoot 'bin\c2.dll'),
-        (Join-Path $vcRoot 'bin\link.exe'),
-        (Join-Path $vcRoot 'bin\lib.exe'),
-        (Join-Path $vcRoot 'bin\amd64\cl.exe'),
-        (Join-Path $vcRoot 'bin\amd64\c1.dll'),
-        (Join-Path $vcRoot 'bin\amd64\c1xx.dll'),
-        (Join-Path $vcRoot 'bin\amd64\c2.dll'),
-        (Join-Path $vcRoot 'bin\amd64\link.exe'),
-        (Join-Path $vcRoot 'bin\amd64\lib.exe'),
-        (Join-Path $vcRoot 'bin\x86_amd64\cl.exe'),
-        (Join-Path $vcRoot 'bin\x86_amd64\c1.dll'),
-        (Join-Path $vcRoot 'bin\x86_amd64\c1xx.dll'),
-        (Join-Path $vcRoot 'bin\x86_amd64\c2.dll')
-      )
-      $keyToolRows = New-Object 'System.Collections.Generic.List[string]'
-      $keyToolRows.Add("path`tsize`tsha256")
-      $keyToolCandidates |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-        Sort-Object -Unique |
-        ForEach-Object {
-          $item = Get-Item -LiteralPath $_
-          $sha256 = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
-          $keyToolRows.Add("$($_)`t$($item.Length)`t$sha256")
-        }
-      Get-ChildItem -LiteralPath $ideRoot -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^(?i)(mspdb.*[.]dll|mspdbsrv[.]exe|mspdbcore[.]dll|msobj140[.]dll)$' } |
+      $exactMatches = @($mspRows | Where-Object { $_.expected_sha1_match })
+      $namedMatches = @($mspRows | Where-Object { $_.named_candidate })
+      [pscustomobject]@{
+        expected_sha1 = $expectedSha1
+        expected_size = $expectedSize
+        expected_payload_found = ($exactMatches.Count -gt 0)
+        expected_payload_count = $exactMatches.Count
+        expected_payload_size_valid = ($exactMatches.Count -gt 0 -and @($exactMatches | Where-Object { -not $_.expected_size_match }).Count -eq 0)
+        named_candidate_count = $namedMatches.Count
+        total_msp_count = $mspRows.Count
+        selected_file_count = $selectedPaths.Count
+        installed_compiler_is_expected = (@($compilerIdentities | Where-Object { -not $_.expected_version_match }).Count -eq 0)
+      } | ConvertTo-Json |
+        Set-Content -LiteralPath (Join-Path $metadataRoot 'RESULT.json') -Encoding UTF8
+
+      $metadataPrefix = $metadataRoot.TrimEnd('\') + '\'
+      Get-ChildItem -LiteralPath $metadataRoot -Recurse -File |
         Sort-Object FullName |
         ForEach-Object {
-          $sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          $keyToolRows.Add("$($_.FullName)`t$($_.Length)`t$sha256")
-        }
-      $keyToolRows | Set-Content -LiteralPath (Join-Path $metadataRoot 'key-tools.tsv') -Encoding ASCII
-
-      # Full pre-compression content manifest.  Paths are relative to the
-      # staging root and therefore reproduce cleanly outside AppVeyor.
-      $capturePrefix = $captureRoot.TrimEnd('\') + '\'
-      $captureManifest = Join-Path $metadataRoot 'CAPTURE_MANIFEST.tsv'
-      $manifestRows = New-Object 'System.Collections.Generic.List[string]'
-      $manifestRows.Add("path`tsize`tsha1`tsha256")
-      Get-ChildItem -LiteralPath $captureRoot -Recurse -File |
-        Sort-Object FullName |
-        ForEach-Object {
-          $relative = $_.FullName.Substring($capturePrefix.Length)
-          $sha1 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA1).Hash.ToLowerInvariant()
-          $sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          $manifestRows.Add("$relative`t$($_.Length)`t$sha1`t$sha256")
-        }
-      $manifestRows | Set-Content -LiteralPath $captureManifest -Encoding ASCII
-
-      @(
-        "appveyor_image=Visual Studio 2015",
-        "expected_msvc_banner=$($env:EXPECTED_MSVC_BANNER)",
-        "x86_cl=$x86Cl",
-        "amd64_cl=$amd64Cl",
-        "amd64_cl_sha256=$amd64ClHash",
-        "expected_chromium_amd64_cl_sha256=$($env:EXPECTED_CHROMIUM_AMD64_CL_SHA256)",
-        "expected_vc_vsu3_msp_sha1=$($env:EXPECTED_VC_VSU3_MSP_SHA1)",
-        "expected_vc_vsu3_msp_found=$($expectedMspFound.ToString().ToLowerInvariant())",
-        "capture_file_count=$((Get-ChildItem -LiteralPath $captureRoot -Recurse -File).Count)",
-        "capture_total_bytes=$((Get-ChildItem -LiteralPath $captureRoot -Recurse -File | Measure-Object -Property Length -Sum).Sum)"
-      ) | Set-Content -LiteralPath (Join-Path $metadataRoot 'SUMMARY.txt') -Encoding ASCII
-
-      # AppVeyor documents 7-Zip as preinstalled.  Split volumes keep each
-      # upload bounded and make interrupted downloads independently retryable.
-      $archiveBase = Join-Path $buildRoot 'msvc-v140-19.00.24215.1.7z'
-      Push-Location $buildRoot
-      try {
-        & 7z.exe a -t7z -mx=3 -mmt=on -v250m $archiveBase '.\capture-root\*' '.\capture-metadata\*'
-        if ($LASTEXITCODE -ne 0) {
-          throw "7-Zip failed with exit code $LASTEXITCODE"
-        }
-      }
-      finally {
-        Pop-Location
-      }
-
-      Get-ChildItem -LiteralPath $buildRoot -Filter 'msvc-v140-19.00.24215.1.7z.*' -File |
-        Sort-Object Name |
-        ForEach-Object {
-          "$($_.Name)`t$($_.Length)`t$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
-        } | Set-Content -LiteralPath (Join-Path $metadataRoot 'ARCHIVE_PARTS.sha256.tsv') -Encoding ASCII
+          $relative = $_.FullName.Substring($metadataPrefix.Length)
+          "$relative`t$($_.Length)`t$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+        } | Set-Content -LiteralPath (Join-Path $metadataRoot 'SHA256SUMS.tsv') -Encoding ASCII
 
 artifacts:
-  - path: 'msvc-v140-19.00.24215.1.7z.*'
-    name: msvc-v140-19.00.24215.1
   - path: capture-metadata
-    name: msvc-v140-19.00.24215.1-metadata
+    name: v140-msp-probe-metadata
+    type: zip
+  - path: capture-root
+    name: v140-msp-probe-selected-payloads
     type: zip
