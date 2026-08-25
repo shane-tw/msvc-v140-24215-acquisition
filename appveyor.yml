@@ -241,8 +241,14 @@ build_script:
         if ((Get-Item -LiteralPath $object).Length -le 0) { throw "$label descriptor object is empty" }
 
         $compile3 = Join-Path $variant 'compile3.json'
-        & python (Join-Path $buildRoot 'parse_compile3.py') $object | Set-Content -LiteralPath $compile3 -Encoding ASCII
-        if ($LASTEXITCODE -ne 0) { throw "$label S_COMPILE3 parse failed: $LASTEXITCODE" }
+        $compile3Stderr = Join-Path $variant 'compile3.stderr.txt'
+        $python = (Get-Command 'python.exe' -ErrorAction Stop).Source
+        $parseProcess = Start-Process -FilePath $python -ArgumentList @("`"$(Join-Path $buildRoot 'parse_compile3.py')`"", "`"$object`"") `
+          -NoNewWindow -Wait -PassThru -RedirectStandardOutput $compile3 -RedirectStandardError $compile3Stderr
+        if ($parseProcess.ExitCode -ne 0) {
+          Get-Content -LiteralPath $compile3, $compile3Stderr | Write-Host
+          throw "$label S_COMPILE3 parse failed: $($parseProcess.ExitCode)"
+        }
         $compileRows = @(Get-Content -LiteralPath $compile3 -Raw | ConvertFrom-Json)
         if ($compileRows.Count -ne 1 -or $compileRows[0].frontend -ne $expectedVersion -or $compileRows[0].backend -ne $expectedVersion) {
           throw "$label S_COMPILE3 mismatch"
