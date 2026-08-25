@@ -1,4 +1,4 @@
-version: "v140-msp-probe-{build}"
+version: "hostx64-targetx86-protobuf-{build}"
 
 image: Visual Studio 2015
 clone_depth: 1
@@ -6,11 +6,16 @@ skip_tags: true
 test: off
 deploy: off
 
+branches:
+  only:
+    - hostx64-targetx86-protobuf-probe
+
 environment:
-  EXPECTED_MSVC_BANNER: 19.00.24215.1
-  EXPECTED_VC_VSU3_MSP_SHA1: 0635238754D5A8C38FE9BAF41296C1E0C8DA49B1
-  EXPECTED_VC_VSU3_MSP_SIZE: 75481088
-  APPVEYOR_ARTIFACT_UPLOAD_TIMEOUT: 600
+  PROTOBUF_URL: https://github.com/protocolbuffers/protobuf/releases/download/v2.6.1/protobuf-2.6.1.tar.gz
+  PROTOBUF_SIZE: 2641426
+  PROTOBUF_SHA256: dbbd7bdd2381633995404de65a945ff1a7610b0da14593051b4738c90c6dd164
+  MSP_SHA256: 6efde51cb390a21fe9b65e792fdc82b5e7e76fee883f7c5ea9a2a4cd78bf1483
+  APPVEYOR_ARTIFACT_UPLOAD_TIMEOUT: 300
 
 build_script:
   - ps: |
@@ -18,193 +23,251 @@ build_script:
       $ErrorActionPreference = 'Stop'
 
       $buildRoot = $env:APPVEYOR_BUILD_FOLDER
-      $captureRoot = Join-Path $buildRoot 'capture-root'
-      $metadataRoot = Join-Path $buildRoot 'capture-metadata'
+      $work = Join-Path $buildRoot 'probe-work'
+      $output = Join-Path $buildRoot 'probe-output'
+      $qfeRoot = Join-Path $work 'qfe'
+      $exactBin = Join-Path $work 'bin-exact-24215'
       $vcRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio 14.0\VC'
-      $packageCacheRoot = 'C:\ProgramData\Package Cache'
-      New-Item -ItemType Directory -Force -Path $captureRoot, $metadataRoot | Out-Null
+      $installedBin = Join-Path $vcRoot 'bin\amd64_x86'
+      New-Item -ItemType Directory -Force -Path $work, $output, $qfeRoot, $exactBin | Out-Null
 
-      function Get-CompilerIdentity {
-        param(
-          [Parameter(Mandatory = $true)][string]$Compiler,
-          [Parameter(Mandatory = $true)][string]$Label
+      function Get-Sha256([string]$path) {
+        return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+      }
+
+      function Assert-File([string]$path, [string]$expectedHash) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+          throw "missing file: $path"
+        }
+        $actual = Get-Sha256 $path
+        if ($actual -ne $expectedHash.ToLowerInvariant()) {
+          throw "hash mismatch: $path expected=$expectedHash actual=$actual"
+        }
+      }
+
+      if (-not (Test-Path -LiteralPath $installedBin -PathType Container)) {
+        throw "installed HostX64.TargetX86 directory missing: $installedBin"
+      }
+
+      $mspCandidates = @(Get-ChildItem -LiteralPath 'C:\ProgramData\Package Cache' -Recurse -Force -File -Filter 'VC_VSU3.5.msp' |
+        Where-Object { (Get-Sha256 $_.FullName) -eq $env:MSP_SHA256 })
+      if ($mspCandidates.Count -ne 1) {
+        throw "expected exactly one exact VC_VSU3.5.msp, found $($mspCandidates.Count)"
+      }
+      $msp = $mspCandidates[0]
+
+      $sevenZip = (Get-Command '7z.exe' -ErrorAction Stop).Source
+      & $sevenZip e -y "-o$qfeRoot" $msp.FullName 'QFE.cab' | Out-File (Join-Path $output 'msp-stream-extract.log') -Encoding ASCII
+      if ($LASTEXITCODE -ne 0) { throw "7z MSP stream extraction failed: $LASTEXITCODE" }
+      $qfeCab = Join-Path $qfeRoot 'QFE.cab'
+      Assert-File $qfeCab '2e0c7bcd88f6f6b287886d7f4dbe486ba2eca6d23780301fd5296e9341ed1a02'
+      & (Join-Path $env:SystemRoot 'System32\expand.exe') '-F:*' $qfeCab $qfeRoot |
+        Out-File (Join-Path $output 'qfe-cab-expand.log') -Encoding ASCII
+      if ($LASTEXITCODE -ne 0) { throw "QFE CAB expansion failed: $LASTEXITCODE" }
+
+      $exactFiles = @{
+        'cl.exe'   = @('cl.exe_ulq14AuEiVH97whYwRBgcIeYNeE_x86', '704075ca34bc6b7b5fe3e279292acf4c7e5a21dc3fc5d1f1c191ad500e79e747')
+        'c1.dll'   = @('c1.dll_4fRTQDjKiHKFPHMoFa5aqR1hk0c_x86', 'cf88c26eed1a70788a7fe2b78d4bb3d9def94ca87716c72c4f2d35c9564dc74d')
+        'c1xx.dll' = @('c1xx.dll_BDmHYZpxuRVGbTn7XtbFWblwyT8_x86', '5900e2c74eefa10299af0a9ed353be098c2a9e68d4bf23f4ad4a92a67e84b0e8')
+        'c2.dll'   = @('c2.dll_fSDnGQXz1mgBc4yQD2fwyarv5bk_x86', '3b258914ea4da54361a6b8a8bda7d2baae2242d7c389234d8828bca9842b81b9')
+        'link.exe' = @('link.exe_tA26bFI2T4xoXiwDEoXkSP3oMdo_x86', '27cc8f739d0f592a4b5a2f3085ac64fca84cad7bf58e9796ba159701ac40abd2')
+      }
+      Copy-Item -Path (Join-Path $installedBin '*') -Destination $exactBin -Recurse -Force
+      foreach ($installedName in $exactFiles.Keys) {
+        $source = Join-Path $qfeRoot $exactFiles[$installedName][0]
+        Assert-File $source $exactFiles[$installedName][1]
+        Copy-Item -LiteralPath $source -Destination (Join-Path $exactBin $installedName) -Force
+      }
+
+      $sourceArchive = Join-Path $work 'protobuf-2.6.1.tar.gz'
+      Invoke-WebRequest -UseBasicParsing -Uri $env:PROTOBUF_URL -OutFile $sourceArchive
+      if ((Get-Item -LiteralPath $sourceArchive).Length -ne [int64]$env:PROTOBUF_SIZE) {
+        throw "protobuf archive size mismatch"
+      }
+      Assert-File $sourceArchive $env:PROTOBUF_SHA256
+      $sourceExtract = Join-Path $work 'source'
+      New-Item -ItemType Directory -Force -Path $sourceExtract | Out-Null
+      & $sevenZip x -y "-o$sourceExtract" $sourceArchive | Out-File (Join-Path $output 'protobuf-gzip-extract.log') -Encoding ASCII
+      if ($LASTEXITCODE -ne 0) { throw "protobuf gzip extraction failed: $LASTEXITCODE" }
+      $sourceTar = Get-ChildItem -LiteralPath $sourceExtract -File -Filter '*.tar' | Select-Object -First 1
+      if ($null -eq $sourceTar) { throw "protobuf tar payload missing" }
+      & $sevenZip x -y "-o$sourceExtract" $sourceTar.FullName | Out-File (Join-Path $output 'protobuf-tar-extract.log') -Encoding ASCII
+      if ($LASTEXITCODE -ne 0) { throw "protobuf tar extraction failed: $LASTEXITCODE" }
+      $sourceRoot = Join-Path $sourceExtract 'protobuf-2.6.1'
+      Assert-File (Join-Path $sourceRoot 'src\google\protobuf\descriptor.cc') '663b30b849721f0dc589f1e9b9db7b092f9b2d839ad16ad44292fd4646b4cf0d'
+
+      $vcInclude = Join-Path $vcRoot 'include'
+      $vcHeaderGates = @{
+        'algorithm'     = '674f0dddc61283e68e4f49c6dbb92628c90ac8a0dabb094f59a7d9b1442b4d3b'
+        'xutility'      = '20c8f017d72895f5b8c251facc96244b5369bab0cdc7cb43ae14101bbcb5e6a9'
+        'vector'        = 'a22d2c4b932d7eb8176070e6f6b17345bbefee627b22d62993a59ffa64b1d0dc'
+        'list'          = 'a27587db203af15111db9eb64d3a14d5d065190bc819ddd96713793c750d993c'
+        'unordered_map' = '400b5005651b7760be7d02dc193fd5097e74eb32cc14f294cadc6da74a19e38d'
+        'xstring'       = '0bec7a1d06de7845e457766311e882a65bb6bd0b32b22aab952f458f5931b6a7'
+        'type_traits'   = 'c20abfc0c990d92bd7ab4419b1138c28d3119737abced8e6c1f4f8c8238d0f76'
+      }
+      foreach ($name in $vcHeaderGates.Keys) {
+        Assert-File (Join-Path $vcInclude $name) $vcHeaderGates[$name]
+      }
+
+      $ucrtHeaderGates = @{
+        'corecrt.h' = '147464f55b954fe5a2033353b95fdf11dbe96274e07baa77d90a6744c94141c6'
+        'stdio.h'   = '9dc21bcf6caf69f4d82c6a609801e0ddf4e8e739447da83d3207d36f8ca6878d'
+        'stdlib.h'  = '44b607c55c32d5b8ea1d86278e5f7d2daf1849ef5f01c6e06026efd3e6d93e2d'
+        'string.h'  = '085e5e11ff47a58d97927a96ff63dce7a66e9fb0d270988369daaac17da6b3a9'
+        'math.h'    = '1219188bde640067374ace8119637dc004c7529913f80f26962e834a0895af6c'
+        'time.h'    = 'b70a2d9a8b1a89e88dfcce1ccd65c0fc4844bc1ecd2b2936cde66fcc2d422ef5'
+      }
+      $ucrtMatches = New-Object 'System.Collections.Generic.List[string]'
+      $ucrtRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
+      foreach ($versionDirectory in @(Get-ChildItem -LiteralPath $ucrtRoot -Directory -ErrorAction Stop)) {
+        $candidate = Join-Path $versionDirectory.FullName 'ucrt'
+        if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
+        $match = $true
+        foreach ($name in $ucrtHeaderGates.Keys) {
+          $path = Join-Path $candidate $name
+          if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Sha256 $path) -ne $ucrtHeaderGates[$name]) {
+            $match = $false
+          }
+        }
+        if ($match) { $ucrtMatches.Add($candidate) }
+      }
+      if ($ucrtMatches.Count -lt 1) { throw "no installed UCRT header set matches the frozen recipe" }
+      $ucrtInclude = @($ucrtMatches | Sort-Object)[0]
+
+      function Capture-Banner([string]$label, [string]$compiler) {
+        $stdout = Join-Path $output "$label-banner-stdout.txt"
+        $stderr = Join-Path $output "$label-banner-stderr.txt"
+        $process = Start-Process -FilePath $compiler -ArgumentList '/?' -NoNewWindow -Wait -PassThru `
+          -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        if ($process.ExitCode -ne 0) { throw "$label compiler banner failed: $($process.ExitCode)" }
+        $banner = ((Get-Content -LiteralPath $stdout -Raw) + "`n" + (Get-Content -LiteralPath $stderr -Raw))
+        $match = [regex]::Match($banner, 'Version\s+([0-9.]+)\s+for\s+([^\s]+)')
+        if (-not $match.Success) { throw "$label compiler banner did not parse" }
+        return [pscustomobject]@{ version = $match.Groups[1].Value; target = $match.Groups[2].Value }
+      }
+
+      function Compile-Descriptor([string]$label, [string]$binDirectory, [string]$expectedVersion) {
+        $variant = Join-Path $output $label
+        New-Item -ItemType Directory -Force -Path $variant | Out-Null
+        $compiler = Join-Path $binDirectory 'cl.exe'
+        $identity = Capture-Banner $label $compiler
+        $normalizedBanner = (($identity.version.Split('.') | ForEach-Object { [int]$_ }) -join '.')
+        if ($normalizedBanner -ne $expectedVersion -or $identity.target -ne 'x86') {
+          throw "$label unexpected compiler identity: $($identity.version) for $($identity.target)"
+        }
+        $pdb = Join-Path $variant 'libprotobuf.pdb'
+        $object = Join-Path $variant 'descriptor.obj'
+        $rsp = Join-Path $variant 'descriptor.rsp'
+        $arguments = @(
+          '/c',
+          '/X',
+          "/I`"$sourceRoot\src`"",
+          "/I`"$sourceRoot\vsprojects`"",
+          "/I`"$vcInclude`"",
+          "/I`"$ucrtInclude`"",
+          '/nologo',
+          '/W3',
+          '/WX-',
+          '/O2',
+          '/Ob2',
+          '/D WIN32',
+          '/D NDEBUG',
+          '/D _WINDOWS',
+          '/D _USRDLL',
+          '/D LIBPROTOBUF_EXPORTS',
+          '/D _MBCS',
+          '/D _SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS',
+          '/D _ALLOW_RUNTIME_LIBRARY_MISMATCH',
+          '/GF',
+          '/Gm-',
+          '/EHsc',
+          '/MT',
+          '/GS',
+          '/Gy',
+          '/fp:precise',
+          '/Zc:wchar_t',
+          '/Zc:forScope',
+          '/Zc:inline',
+          '/GR',
+          '/Zi',
+          "/Fd`"$pdb`"",
+          "/Fo`"$object`"",
+          '/Gd',
+          '/TP',
+          '/wd4244',
+          '/wd4267',
+          '/wd4018',
+          '/wd4355',
+          '/wd4800',
+          '/wd4251',
+          '/wd4996',
+          '/wd4146',
+          '/wd4305',
+          "`"$sourceRoot\src\google\protobuf\descriptor.cc`""
         )
+        [System.IO.File]::WriteAllLines($rsp, $arguments, [System.Text.Encoding]::ASCII)
+        $stdout = Join-Path $variant 'descriptor-compile.stdout.txt'
+        $stderr = Join-Path $variant 'descriptor-compile.stderr.txt'
+        $process = Start-Process -FilePath $compiler -ArgumentList "@$rsp" -WorkingDirectory $binDirectory `
+          -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $process.ExitCode | Set-Content -LiteralPath (Join-Path $variant 'descriptor-compile.exit') -Encoding ASCII
+        if ($process.ExitCode -ne 0) { throw "$label descriptor compile failed: $($process.ExitCode)" }
+        if ((Get-Item -LiteralPath $object).Length -le 0) { throw "$label descriptor object is empty" }
 
-        if (-not (Test-Path -LiteralPath $Compiler -PathType Leaf)) {
-          return [pscustomobject]@{
-            label = $Label; path = $Compiler; status = 'missing'; error = 'compiler path absent'
-            banner_version = $null; target = $null; expected_version = $env:EXPECTED_MSVC_BANNER
-            expected_version_match = $false; size = $null; sha256 = $null
-            file_version = $null; product_version = $null; signature_status = $null; signer = $null
-          }
+        $compile3 = Join-Path $variant 'compile3.json'
+        & python (Join-Path $buildRoot 'parse_compile3.py') $object | Set-Content -LiteralPath $compile3 -Encoding ASCII
+        if ($LASTEXITCODE -ne 0) { throw "$label S_COMPILE3 parse failed: $LASTEXITCODE" }
+        $compileRows = @(Get-Content -LiteralPath $compile3 -Raw | ConvertFrom-Json)
+        if ($compileRows.Count -ne 1 -or $compileRows[0].frontend -ne $expectedVersion -or $compileRows[0].backend -ne $expectedVersion) {
+          throw "$label S_COMPILE3 mismatch"
         }
 
-        $stdoutPath = Join-Path $metadataRoot "$Label-cl-stdout.txt"
-        $stderrPath = Join-Path $metadataRoot "$Label-cl-stderr.txt"
-        try {
-          $process = Start-Process -FilePath $Compiler -ArgumentList '/?' -NoNewWindow -Wait -PassThru `
-            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
-          $banner = ((Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) + "`n" +
-            (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue)).Trim()
-          $banner | Set-Content -LiteralPath (Join-Path $metadataRoot "$Label-banner.txt") -Encoding ASCII
-          $match = [regex]::Match($banner, 'Version\s+([0-9.]+)\s+for\s+([^\s]+)')
-          $item = Get-Item -LiteralPath $Compiler
-          $signature = Get-AuthenticodeSignature -LiteralPath $Compiler
-          return [pscustomobject]@{
-            label = $Label; path = $Compiler; status = if ($match.Success) { 'parsed' } else { 'unparsed' }
-            error = if ($match.Success) { $null } else { 'compiler banner regex did not match' }
-            exit_code = $process.ExitCode
-            banner_version = if ($match.Success) { $match.Groups[1].Value } else { $null }
-            target = if ($match.Success) { $match.Groups[2].Value } else { $null }
-            expected_version = $env:EXPECTED_MSVC_BANNER
-            expected_version_match = ($match.Success -and $match.Groups[1].Value -eq $env:EXPECTED_MSVC_BANNER)
-            size = $item.Length
-            sha256 = (Get-FileHash -LiteralPath $Compiler -Algorithm SHA256).Hash.ToLowerInvariant()
-            file_version = $item.VersionInfo.FileVersion
-            product_version = $item.VersionInfo.ProductVersion
-            signature_status = $signature.Status.ToString()
-            signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { $null }
-          }
+        $fileRows = foreach ($name in @('cl.exe', 'c1.dll', 'c1xx.dll', 'c2.dll')) {
+          $path = Join-Path $binDirectory $name
+          [pscustomobject]@{ name = $name; size = (Get-Item -LiteralPath $path).Length; sha256 = Get-Sha256 $path }
         }
-        catch {
-          return [pscustomobject]@{
-            label = $Label; path = $Compiler; status = 'error'; error = $_.Exception.Message
-            banner_version = $null; target = $null; expected_version = $env:EXPECTED_MSVC_BANNER
-            expected_version_match = $false; size = $null; sha256 = $null
-            file_version = $null; product_version = $null; signature_status = $null; signer = $null
-          }
-        }
+        [pscustomobject]@{
+          label = $label
+          banner_version = $identity.version
+          target = $identity.target
+          object_size = (Get-Item -LiteralPath $object).Length
+          object_sha256 = Get-Sha256 $object
+          pdb_size = (Get-Item -LiteralPath $pdb).Length
+          pdb_sha256 = Get-Sha256 $pdb
+          compiler_files = @($fileRows)
+          compile3 = @($compileRows)
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $variant 'identity.json') -Encoding UTF8
       }
 
-      $x86Cl = Join-Path $vcRoot 'bin\cl.exe'
-      $amd64Cl = Join-Path $vcRoot 'bin\amd64\cl.exe'
-      if (-not (Test-Path -LiteralPath $amd64Cl -PathType Leaf)) {
-        $amd64Cl = Join-Path $vcRoot 'bin\x86_amd64\cl.exe'
-      }
-      $compilerIdentities = @(
-        Get-CompilerIdentity -Compiler $x86Cl -Label 'x86'
-        Get-CompilerIdentity -Compiler $amd64Cl -Label 'amd64'
-      )
-      $compilerIdentities | ConvertTo-Json -Depth 5 |
-        Set-Content -LiteralPath (Join-Path $metadataRoot 'compiler-identities.json') -Encoding UTF8
+      Compile-Descriptor 'hostx64-targetx86-24215' $exactBin '19.0.24215.1'
+      Compile-Descriptor 'hostx64-targetx86-24241' $installedBin '19.0.24241.7'
 
-      @(
-        "os_version=$([System.Environment]::OSVersion.VersionString)",
-        "is_64_bit_os=$([System.Environment]::Is64BitOperatingSystem)",
-        "powershell_version=$($PSVersionTable.PSVersion.ToString())"
-      ) | Set-Content -LiteralPath (Join-Path $metadataRoot 'worker-os.txt') -Encoding ASCII
-      @(
-        "APPVEYOR_BUILD_WORKER_IMAGE=$env:APPVEYOR_BUILD_WORKER_IMAGE",
-        "APPVEYOR_BUILD_ID=$env:APPVEYOR_BUILD_ID",
-        "APPVEYOR_JOB_ID=$env:APPVEYOR_JOB_ID",
-        "APPVEYOR_BUILD_VERSION=$env:APPVEYOR_BUILD_VERSION",
-        "APPVEYOR_REPO_COMMIT=$env:APPVEYOR_REPO_COMMIT"
-      ) | Set-Content -LiteralPath (Join-Path $metadataRoot 'appveyor-environment.txt') -Encoding ASCII
-
-      function Copy-PackageCacheFile {
-        param([Parameter(Mandatory = $true)][string]$Source)
-        $cachePrefix = $packageCacheRoot.TrimEnd('\') + '\'
-        if (-not $Source.StartsWith($cachePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-          throw "Package Cache path escaped its root: $Source"
-        }
-        $relative = $Source.Substring($cachePrefix.Length)
-        $destination = Join-Path (Join-Path $captureRoot 'PackageCache') $relative
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-        Copy-Item -LiteralPath $Source -Destination $destination -Force
-      }
-
-      $expectedSha1 = $env:EXPECTED_VC_VSU3_MSP_SHA1.ToUpperInvariant()
-      $expectedSize = [int64]$env:EXPECTED_VC_VSU3_MSP_SIZE
-      $mspRows = New-Object 'System.Collections.Generic.List[object]'
-      $selectedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-      $scanComplete = $false
-      $scanError = $null
-      $discoveredCount = 0
-      $hashedCount = 0
-      $selectedBytes = [int64]0
-      $selectedByteCap = [int64](256MB)
-      if (Test-Path -LiteralPath $packageCacheRoot -PathType Container) {
-        try {
-          $mspFiles = @(Get-ChildItem -LiteralPath $packageCacheRoot -Recurse -Force -File -Filter '*.msp' -ErrorAction Stop |
-            Sort-Object FullName)
-          $discoveredCount = $mspFiles.Count
-          foreach ($mspFile in $mspFiles) {
-            $sha1 = (Get-FileHash -LiteralPath $mspFile.FullName -Algorithm SHA1).Hash.ToUpperInvariant()
-            $sha256 = (Get-FileHash -LiteralPath $mspFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            $hashedCount++
-            $exactHash = ($sha1 -eq $expectedSha1)
-            $exactSize = ($mspFile.Length -eq $expectedSize)
-            $namedCandidate = ($mspFile.FullName -match '(?i)VC[_-]?VSU3|KB3165756|14[.]0[.](24215|25425)')
-            $selected = ($exactHash -and $exactSize) -or $namedCandidate
-            $copyOmittedByCap = ($selected -and ($selectedBytes + $mspFile.Length -gt $selectedByteCap))
-            $mspRows.Add([pscustomobject]@{
-              path = $mspFile.FullName
-              size = $mspFile.Length
-              sha1 = $sha1
-              sha256 = $sha256
-              expected_sha1_match = $exactHash
-              expected_size_match = $exactSize
-              named_candidate = $namedCandidate
-              selected = $selected
-              copy_omitted_by_cap = $copyOmittedByCap
-            })
-            if ($selected -and -not $copyOmittedByCap) {
-              $selectedBytes += $mspFile.Length
-              [void]$selectedPaths.Add($mspFile.FullName)
-              Copy-PackageCacheFile -Source $mspFile.FullName
-              Get-ChildItem -LiteralPath $mspFile.DirectoryName -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -lt 4MB -and $_.Extension -match '(?i)^\.(xml|json|manifest|txt|ini|rsm)$' } |
-                ForEach-Object {
-                  if ($selectedBytes + $_.Length -le $selectedByteCap) {
-                    $selectedBytes += $_.Length
-                    [void]$selectedPaths.Add($_.FullName)
-                    Copy-PackageCacheFile -Source $_.FullName
-                  }
-                }
-            }
-          }
-          $scanComplete = $true
-        }
-        catch {
-          $scanError = $_.Exception.Message
-        }
-      }
-      $mspRows | ConvertTo-Json -Depth 5 |
-        Set-Content -LiteralPath (Join-Path $metadataRoot 'package-cache-msp.json') -Encoding UTF8
-
-      $exactMatches = @($mspRows | Where-Object { $_.expected_sha1_match -and $_.expected_size_match })
-      $namedMatches = @($mspRows | Where-Object { $_.named_candidate })
       [pscustomobject]@{
-        expected_sha1 = $expectedSha1
-        expected_size = $expectedSize
-        expected_payload_found = ($exactMatches.Count -gt 0)
-        expected_payload_count = $exactMatches.Count
-        expected_payload_size_valid = ($exactMatches.Count -gt 0 -and @($exactMatches | Where-Object { -not $_.expected_size_match }).Count -eq 0)
-        named_candidate_count = $namedMatches.Count
-        scan_complete = $scanComplete
-        scan_error = $scanError
-        discovered_msp_count = $discoveredCount
-        hashed_msp_count = $hashedCount
-        total_msp_count = $mspRows.Count
-        selected_file_count = $selectedPaths.Count
-        selected_total_bytes = $selectedBytes
-        selected_byte_cap = $selectedByteCap
-        installed_compiler_is_expected = (@($compilerIdentities | Where-Object { -not $_.expected_version_match }).Count -eq 0)
-      } | ConvertTo-Json |
-        Set-Content -LiteralPath (Join-Path $metadataRoot 'RESULT.json') -Encoding UTF8
+        image = $env:APPVEYOR_BUILD_WORKER_IMAGE
+        build_id = $env:APPVEYOR_BUILD_ID
+        job_id = $env:APPVEYOR_JOB_ID
+        commit = $env:APPVEYOR_REPO_COMMIT
+        protobuf_url = $env:PROTOBUF_URL
+        protobuf_size = (Get-Item -LiteralPath $sourceArchive).Length
+        protobuf_sha256 = Get-Sha256 $sourceArchive
+        msp_path = $msp.FullName
+        msp_size = $msp.Length
+        msp_sha256 = Get-Sha256 $msp.FullName
+        vc_include = $vcInclude
+        ucrt_include = $ucrtInclude
+        ucrt_matching_sets = @($ucrtMatches)
+      } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $output 'provenance.json') -Encoding UTF8
 
-      $metadataPrefix = $metadataRoot.TrimEnd('\') + '\'
-      Get-ChildItem -LiteralPath $metadataRoot -Recurse -File |
+      $outputPrefix = $output.TrimEnd('\') + '\'
+      Get-ChildItem -LiteralPath $output -Recurse -File |
         Sort-Object FullName |
         ForEach-Object {
-          $relative = $_.FullName.Substring($metadataPrefix.Length)
-          "$relative`t$($_.Length)`t$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
-        } | Set-Content -LiteralPath (Join-Path $metadataRoot 'SHA256SUMS.tsv') -Encoding ASCII
+          $relative = $_.FullName.Substring($outputPrefix.Length)
+          "$relative`t$($_.Length)`t$(Get-Sha256 $_.FullName)"
+        } | Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.tsv') -Encoding ASCII
 
 artifacts:
-  - path: capture-metadata
-    name: v140-msp-probe-metadata
-    type: zip
-  - path: capture-root
-    name: v140-msp-probe-selected-payloads
+  - path: probe-output
+    name: hostx64-targetx86-protobuf-probe
     type: zip
