@@ -73,7 +73,7 @@ build_script:
       }
       $streamStdout = Join-Path $output 'msp-stream-extract.stdout.txt'
       $streamStderr = Join-Path $output 'msp-stream-extract.stderr.txt'
-      $streamProcess = Start-Process -FilePath $streamExtractor -ArgumentList @("`"$($msp.FullName)`"", 'QFE.cab', "`"$qfeCab`"") `
+      $streamProcess = Start-Process -FilePath $streamExtractor -ArgumentList @("`"$($msp.FullName)`"", '56267877', "`"$qfeCab`"") `
         -NoNewWindow -Wait -PassThru -RedirectStandardOutput $streamStdout -RedirectStandardError $streamStderr
       if ($streamProcess.ExitCode -ne 0) {
         Get-Content -LiteralPath $streamStdout, $streamStderr | Write-Host
