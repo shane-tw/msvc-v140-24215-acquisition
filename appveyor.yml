@@ -29,6 +29,7 @@ build_script:
       $exactBin = Join-Path $work 'bin-exact-24215'
       $vcRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio 14.0\VC'
       $installedHostX64Bin = Join-Path $vcRoot 'bin\amd64_x86'
+      $installedHostX64SupportBin = Join-Path $vcRoot 'bin\amd64'
       $installedHostX86Bin = Join-Path $vcRoot 'bin'
       New-Item -ItemType Directory -Force -Path $work, $output, $qfeRoot, $exactBin | Out-Null
 
@@ -48,6 +49,9 @@ build_script:
 
       if (-not (Test-Path -LiteralPath $installedHostX64Bin -PathType Container)) {
         throw "installed HostX64.TargetX86 directory missing: $installedHostX64Bin"
+      }
+      if (-not (Test-Path -LiteralPath $installedHostX64SupportBin -PathType Container)) {
+        throw "installed HostX64 support directory missing: $installedHostX64SupportBin"
       }
       if (-not (Test-Path -LiteralPath $installedHostX86Bin -PathType Container)) {
         throw "installed HostX86.TargetX86 directory missing: $installedHostX86Bin"
@@ -91,6 +95,7 @@ build_script:
         'c2.dll'   = @('c2.dll_fSDnGQXz1mgBc4yQD2fwyarv5bk_x86', '3b258914ea4da54361a6b8a8bda7d2baae2242d7c389234d8828bca9842b81b9')
         'link.exe' = @('link.exe_tA26bFI2T4xoXiwDEoXkSP3oMdo_x86', '27cc8f739d0f592a4b5a2f3085ac64fca84cad7bf58e9796ba159701ac40abd2')
       }
+      Copy-Item -Path (Join-Path $installedHostX64SupportBin '*') -Destination $exactBin -Recurse -Force
       Copy-Item -Path (Join-Path $installedHostX64Bin '*') -Destination $exactBin -Recurse -Force
       foreach ($installedName in $exactFiles.Keys) {
         $source = Join-Path $qfeRoot $exactFiles[$installedName][0]
