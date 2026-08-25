@@ -27,11 +27,12 @@ build_script:
       $output = Join-Path $buildRoot 'probe-output'
       $qfeRoot = Join-Path $work 'qfe'
       $exactBin = Join-Path $work 'bin-exact-24215'
+      $currentHostX64Bin = Join-Path $work 'bin-current-hostx64-24241'
       $vcRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio 14.0\VC'
       $installedHostX64Bin = Join-Path $vcRoot 'bin\amd64_x86'
       $installedHostX64SupportBin = Join-Path $vcRoot 'bin\amd64'
       $installedHostX86Bin = Join-Path $vcRoot 'bin'
-      New-Item -ItemType Directory -Force -Path $work, $output, $qfeRoot, $exactBin | Out-Null
+      New-Item -ItemType Directory -Force -Path $work, $output, $qfeRoot, $exactBin, $currentHostX64Bin | Out-Null
 
       function Get-Sha256([string]$path) {
         return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -95,8 +96,9 @@ build_script:
         'c2.dll'   = @('c2.dll_fSDnGQXz1mgBc4yQD2fwyarv5bk_x86', '3b258914ea4da54361a6b8a8bda7d2baae2242d7c389234d8828bca9842b81b9')
         'link.exe' = @('link.exe_tA26bFI2T4xoXiwDEoXkSP3oMdo_x86', '27cc8f739d0f592a4b5a2f3085ac64fca84cad7bf58e9796ba159701ac40abd2')
       }
-      Copy-Item -Path (Join-Path $installedHostX64SupportBin '*') -Destination $exactBin -Recurse -Force
-      Copy-Item -Path (Join-Path $installedHostX64Bin '*') -Destination $exactBin -Recurse -Force
+      Copy-Item -Path (Join-Path $installedHostX64SupportBin '*') -Destination $currentHostX64Bin -Recurse -Force
+      Copy-Item -Path (Join-Path $installedHostX64Bin '*') -Destination $currentHostX64Bin -Recurse -Force
+      Copy-Item -Path (Join-Path $currentHostX64Bin '*') -Destination $exactBin -Recurse -Force
       foreach ($installedName in $exactFiles.Keys) {
         $source = Join-Path $qfeRoot $exactFiles[$installedName][0]
         Assert-File $source $exactFiles[$installedName][1]
@@ -272,7 +274,7 @@ build_script:
       }
 
       Compile-Descriptor 'hostx64-targetx86-24215' $exactBin '19.0.24215.1'
-      Compile-Descriptor 'hostx64-targetx86-24241' $installedHostX64Bin '19.0.24241.7'
+      Compile-Descriptor 'hostx64-targetx86-24241' $currentHostX64Bin '19.0.24241.7'
       Compile-Descriptor 'hostx86-targetx86-24241' $installedHostX86Bin '19.0.24241.7'
 
       Get-ChildItem -LiteralPath $output -Recurse -File -Filter '*.pdb' | Remove-Item -Force

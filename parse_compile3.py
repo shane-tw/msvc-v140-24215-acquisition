@@ -4,7 +4,6 @@
 import json
 import struct
 import sys
-from pathlib import Path
 
 
 def u16(data, offset):
@@ -16,7 +15,8 @@ def u32(data, offset):
 
 
 def main():
-    data = Path(sys.argv[1]).read_bytes()
+    with open(sys.argv[1], "rb") as source:
+        data = source.read()
     if len(data) < 20:
         raise SystemExit("short COFF header")
     machine, section_count = struct.unpack_from("<HH", data, 0)
