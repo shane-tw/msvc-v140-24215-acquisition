@@ -61,11 +61,24 @@ build_script:
       $msp = $mspCandidates[0]
 
       $qfeCab = Join-Path $qfeRoot 'QFE.cab'
-      $streamExtractor = Join-Path $work 'extract_msi_stream.exe'
-      Add-Type -Path (Join-Path $buildRoot 'extract_msi_stream.cs') -OutputAssembly $streamExtractor -OutputType ConsoleApplication
-      & $streamExtractor $msp.FullName 'QFE.cab' $qfeCab |
-        Out-File (Join-Path $output 'msp-stream-extract.log') -Encoding ASCII
-      if ($LASTEXITCODE -ne 0) { throw "MSI API stream extraction failed: $LASTEXITCODE" }
+      $streamExtractor = Join-Path $work 'extract_ole_stream.exe'
+      $csc = Join-Path $env:SystemRoot 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+      $cscStdout = Join-Path $output 'stream-extractor-build.stdout.txt'
+      $cscStderr = Join-Path $output 'stream-extractor-build.stderr.txt'
+      $cscProcess = Start-Process -FilePath $csc -ArgumentList @('/nologo', '/target:exe', "/out:$streamExtractor", (Join-Path $buildRoot 'extract_ole_stream.cs')) `
+        -NoNewWindow -Wait -PassThru -RedirectStandardOutput $cscStdout -RedirectStandardError $cscStderr
+      if ($cscProcess.ExitCode -ne 0) {
+        Get-Content -LiteralPath $cscStdout, $cscStderr | Write-Host
+        throw "OLE stream extractor build failed: $($cscProcess.ExitCode)"
+      }
+      $streamStdout = Join-Path $output 'msp-stream-extract.stdout.txt'
+      $streamStderr = Join-Path $output 'msp-stream-extract.stderr.txt'
+      $streamProcess = Start-Process -FilePath $streamExtractor -ArgumentList @("`"$($msp.FullName)`"", 'QFE.cab', "`"$qfeCab`"") `
+        -NoNewWindow -Wait -PassThru -RedirectStandardOutput $streamStdout -RedirectStandardError $streamStderr
+      if ($streamProcess.ExitCode -ne 0) {
+        Get-Content -LiteralPath $streamStdout, $streamStderr | Write-Host
+        throw "OLE stream extraction failed: $($streamProcess.ExitCode)"
+      }
       Assert-File $qfeCab '2e0c7bcd88f6f6b287886d7f4dbe486ba2eca6d23780301fd5296e9341ed1a02'
       & (Join-Path $env:SystemRoot 'System32\expand.exe') '-F:*' $qfeCab $qfeRoot |
         Out-File (Join-Path $output 'qfe-cab-expand.log') -Encoding ASCII
