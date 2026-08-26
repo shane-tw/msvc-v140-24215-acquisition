@@ -1,4 +1,4 @@
-version: "exact24215-public-project-replay-{build}"
+version: "exact24215-full-valve-archive-{build}"
 
 image: Visual Studio 2015
 clone_depth: 1
@@ -307,9 +307,6 @@ build_script:
       if ($descriptorNodes.Count -ne 1) {
         throw "converted project expected one descriptor.cc item, found $($descriptorNodes.Count)"
       }
-      foreach ($node in $compileNodes) {
-        if ($node -ne $descriptorNodes[0]) { [void]$node.ParentNode.RemoveChild($node) }
-      }
       $releaseRuntime = $projectXml.SelectSingleNode("//m:ItemDefinitionGroup[@Condition=`"'`$(Configuration)|`$(Platform)'=='Release|Win32'`"]//m:ClCompile/m:RuntimeLibrary", $namespace)
       if ($null -eq $releaseRuntime -or $releaseRuntime.InnerText -ne 'MultiThreadedDLL') {
         throw "converted project Release runtime was not the expected MultiThreadedDLL default"
@@ -317,24 +314,27 @@ build_script:
       # The public object's directives prove this local project override even
       # though the committed upstream vcproj still names the DLL runtime.
       $releaseRuntime.InnerText = 'MultiThreaded'
-      if ($null -ne $descriptorNodes[0].SelectSingleNode('m:PreprocessorDefinitions', $namespace)) {
-        throw "descriptor.cc unexpectedly has per-item preprocessor definitions"
+      $releaseCompile = $projectXml.SelectSingleNode("//m:ItemDefinitionGroup[@Condition=`"'`$(Configuration)|`$(Platform)'=='Release|Win32'`"]//m:ClCompile", $namespace)
+      if ($null -eq $releaseCompile) {
+        throw "converted project Release ClCompile defaults missing"
       }
-      $compatibilityDefines = $projectXml.CreateElement('PreprocessorDefinitions', 'http://schemas.microsoft.com/developer/msbuild/2003')
-      $compatibilityDefines.InnerText = '_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS;%(PreprocessorDefinitions)'
-      [void]$descriptorNodes[0].AppendChild($compatibilityDefines)
+      $compatibilityDefines = $releaseCompile.SelectSingleNode('m:PreprocessorDefinitions', $namespace)
+      if ($null -eq $compatibilityDefines -or $compatibilityDefines.InnerText -match '_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS') {
+        throw "converted project Release preprocessor defaults unexpected"
+      }
+      $compatibilityDefines.InnerText = '_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS;' + $compatibilityDefines.InnerText
       $xmlSettings = New-Object System.Xml.XmlWriterSettings
       $xmlSettings.Encoding = New-Object System.Text.UTF8Encoding($false)
       $xmlSettings.Indent = $true
       $xmlWriter = [System.Xml.XmlWriter]::Create($convertedVcxproj, $xmlSettings)
       try { $projectXml.Save($xmlWriter) } finally { $xmlWriter.Dispose() }
-      $reducedHash = Get-Sha256 $convertedVcxproj
-      Copy-Item -LiteralPath $convertedVcxproj -Destination (Join-Path $projectEvidence 'libprotobuf.static-runtime-descriptor-only.vcxproj')
+      $staticFullHash = Get-Sha256 $convertedVcxproj
+      Copy-Item -LiteralPath $convertedVcxproj -Destination (Join-Path $projectEvidence 'libprotobuf.static-runtime-full.vcxproj')
 
       $msbuild = Join-Path ${env:ProgramFiles(x86)} 'MSBuild\14.0\Bin\MSBuild.exe'
       if (-not (Test-Path -LiteralPath $msbuild -PathType Leaf)) { throw "MSBuild 14 missing: $msbuild" }
 
-      foreach ($name in @('cl.exe', 'c1.dll', 'c1xx.dll', 'c2.dll')) {
+      foreach ($name in @('cl.exe', 'c1.dll', 'c1xx.dll', 'c2.dll', 'link.exe')) {
         Assert-File (Join-Path $exactBin $name) $exactFiles[$name][1]
       }
 
@@ -355,121 +355,213 @@ build_script:
         Assert-File $destination $valveHeaderGates[$name]
       }
 
-      function Build-ConvertedDescriptor([string]$label, [string]$sourceKind) {
-        $variant = Join-Path $output $label
-        $intermediate = Join-Path $sourceRoot 'vsprojects\Release'
-        if (Test-Path -LiteralPath $intermediate) {
-          $expectedIntermediate = (Join-Path $sourceRoot 'vsprojects\Release').ToLowerInvariant()
-          if ($intermediate.ToLowerInvariant() -ne $expectedIntermediate) {
-            throw "refusing to clean unexpected intermediate directory: $intermediate"
-          }
-          Remove-Item -LiteralPath $intermediate -Recurse -Force
-        }
-        New-Item -ItemType Directory -Force -Path $variant, $intermediate | Out-Null
+      foreach ($name in @('repeated_field.h', 'wire_format_lite_inl.h')) {
+        Copy-Item -LiteralPath (Join-Path $valveHeaderRoot $name) -Destination (Join-Path $sourceRoot "src\google\protobuf\$name") -Force
+        Assert-File (Join-Path $sourceRoot "src\google\protobuf\$name") $valveHeaderGates[$name]
+      }
 
-        $compilerIdentity = Capture-Banner $label (Join-Path $exactBin 'cl.exe')
-        $normalizedBanner = (($compilerIdentity.version.Split('.') | ForEach-Object { [int]$_ }) -join '.')
-        if ($normalizedBanner -ne '19.0.24215.1' -or $compilerIdentity.target -ne 'x86') {
-          throw "$label unexpected compiler identity: $($compilerIdentity.version) for $($compilerIdentity.target)"
+      $label = 'exact24215-hostx64-valve-mt-full-archive'
+      $variant = Join-Path $output $label
+      $intermediate = Join-Path $sourceRoot 'vsprojects\Release'
+      if (Test-Path -LiteralPath $intermediate) {
+        $expectedIntermediate = (Join-Path $sourceRoot 'vsprojects\Release').ToLowerInvariant()
+        if ($intermediate.ToLowerInvariant() -ne $expectedIntermediate) {
+          throw "refusing to clean unexpected intermediate directory: $intermediate"
         }
+        Remove-Item -LiteralPath $intermediate -Recurse -Force
+      }
+      New-Item -ItemType Directory -Force -Path $variant | Out-Null
 
-        $activeHeaderHashes = @{}
-        foreach ($name in @('repeated_field.h', 'wire_format_lite_inl.h')) {
-          $path = Join-Path $sourceRoot "src\google\protobuf\$name"
-          $expected = if ($sourceKind -eq 'valve') { $valveHeaderGates[$name] } else { $stockHeaderGates[$name] }
-          Assert-File $path $expected
-          $activeHeaderHashes[$name] = Get-Sha256 $path
+      $compilerIdentity = Capture-Banner $label (Join-Path $exactBin 'cl.exe')
+      $normalizedBanner = (($compilerIdentity.version.Split('.') | ForEach-Object { [int]$_ }) -join '.')
+      if ($normalizedBanner -ne '19.0.24215.1' -or $compilerIdentity.target -ne 'x86') {
+        throw "$label unexpected compiler identity: $($compilerIdentity.version) for $($compilerIdentity.target)"
+      }
+
+      $msbuildStdout = Join-Path $variant 'msbuild.stdout.txt'
+      $msbuildStderr = Join-Path $variant 'msbuild.stderr.txt'
+      $msbuildDiagnostic = Join-Path $variant 'msbuild-diagnostic.log'
+      $msbuildArguments = @(
+        "`"$convertedVcxproj`"",
+        '/nologo',
+        '/m:1',
+        '/t:Rebuild',
+        '/p:Configuration=Release',
+        '/p:Platform=Win32',
+        '/p:PlatformToolset=v140',
+        '/p:PreferredToolArchitecture=x64',
+        "/p:CLToolPath=$exactBin",
+        '/p:CLToolExe=cl.exe',
+        "/p:LibToolPath=$exactBin",
+        '/p:LibToolExe=lib.exe',
+        '/p:TrackFileAccess=false',
+        '/v:diag',
+        '/fl',
+        "/flp:logfile=$msbuildDiagnostic;verbosity=diagnostic"
+      )
+      [System.IO.File]::WriteAllLines((Join-Path $variant 'msbuild.args.txt'), $msbuildArguments, [System.Text.Encoding]::ASCII)
+      $msbuildProcess = Start-Process -FilePath $msbuild -ArgumentList $msbuildArguments `
+        -WorkingDirectory (Split-Path -Parent $convertedVcxproj) -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $msbuildStdout -RedirectStandardError $msbuildStderr
+      $msbuildProcess.ExitCode | Set-Content -LiteralPath (Join-Path $variant 'msbuild.exit') -Encoding ASCII
+      if ($msbuildProcess.ExitCode -ne 0) {
+        Get-Content -LiteralPath $msbuildStdout, $msbuildStderr | Select-Object -Last 240 | Write-Host
+        throw "$label converted vcproj full archive build failed: $($msbuildProcess.ExitCode)"
+      }
+
+      $builtArchive = Join-Path $intermediate 'libprotobuf.lib'
+      if (-not (Test-Path -LiteralPath $builtArchive -PathType Leaf) -or (Get-Item -LiteralPath $builtArchive).Length -le 0) {
+        throw "$label output archive missing or empty: $builtArchive"
+      }
+      $objects = @(Get-ChildItem -LiteralPath $intermediate -File -Filter '*.obj')
+      if ($objects.Count -ne 34) {
+        throw "$label expected 34 objects, found $($objects.Count)"
+      }
+
+      $expectedArchiveOrder = @(
+        'wire_format_lite.obj',
+        'wire_format.obj',
+        'unknown_field_set.obj',
+        'text_format.obj',
+        'substitute.obj',
+        'strutil.obj',
+        'structurally_valid.obj',
+        'stringprintf.obj',
+        'once.obj',
+        'common.obj',
+        'atomicops_internals_x86_msvc.obj',
+        'service.obj',
+        'repeated_field.obj',
+        'reflection_ops.obj',
+        'message_lite.obj',
+        'message.obj',
+        'zero_copy_stream_impl_lite.obj',
+        'zero_copy_stream_impl.obj',
+        'zero_copy_stream.obj',
+        'tokenizer.obj',
+        'strtod.obj',
+        'printer.obj',
+        'gzip_stream.obj',
+        'coded_stream.obj',
+        'generated_message_util.obj',
+        'generated_message_reflection.obj',
+        'extension_set_heavy.obj',
+        'extension_set.obj',
+        'dynamic_message.obj',
+        'descriptor_database.obj',
+        'descriptor.pb.obj',
+        'descriptor.obj',
+        'parser.obj',
+        'importer.obj'
+      )
+      $objectNames = @($objects | ForEach-Object { $_.Name.ToLowerInvariant() } | Sort-Object)
+      $expectedNames = @($expectedArchiveOrder | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object)
+      if (($objectNames -join "`n") -ne ($expectedNames -join "`n")) {
+        throw "$label object membership differs from frozen 34-member set"
+      }
+
+      $librarian = Join-Path $exactBin 'lib.exe'
+      if (-not (Test-Path -LiteralPath $librarian -PathType Leaf)) { throw "librarian missing: $librarian" }
+      $listStdout = Join-Path $variant 'lib-list.stdout.txt'
+      $listStderr = Join-Path $variant 'lib-list.stderr.txt'
+      $listProcess = Start-Process -FilePath $librarian -ArgumentList @('/nologo', '/list', "`"$builtArchive`"") `
+        -NoNewWindow -Wait -PassThru -RedirectStandardOutput $listStdout -RedirectStandardError $listStderr
+      if ($listProcess.ExitCode -ne 0) {
+        Get-Content -LiteralPath $listStdout, $listStderr | Write-Host
+        throw "$label librarian member listing failed: $($listProcess.ExitCode)"
+      }
+      $actualArchiveOrder = @(Get-Content -LiteralPath $listStdout | Where-Object { $_.Trim().ToLowerInvariant().EndsWith('.obj') } | ForEach-Object { [System.IO.Path]::GetFileName($_.Trim()) })
+      if ($actualArchiveOrder.Count -ne $expectedArchiveOrder.Count) {
+        throw "$label archive member count mismatch: expected=$($expectedArchiveOrder.Count) actual=$($actualArchiveOrder.Count)"
+      }
+      for ($index = 0; $index -lt $expectedArchiveOrder.Count; $index++) {
+        if ($actualArchiveOrder[$index].ToLowerInvariant() -ne $expectedArchiveOrder[$index].ToLowerInvariant()) {
+          throw "$label archive order mismatch at $index expected=$($expectedArchiveOrder[$index]) actual=$($actualArchiveOrder[$index])"
         }
+      }
+      [System.IO.File]::WriteAllLines((Join-Path $variant 'expected-archive-order.txt'), $expectedArchiveOrder, [System.Text.Encoding]::ASCII)
+      [System.IO.File]::WriteAllLines((Join-Path $variant 'actual-archive-order.txt'), $actualArchiveOrder, [System.Text.Encoding]::ASCII)
 
-        $msbuildStdout = Join-Path $variant 'msbuild.stdout.txt'
-        $msbuildStderr = Join-Path $variant 'msbuild.stderr.txt'
-        $msbuildDiagnostic = Join-Path $variant 'msbuild-diagnostic.log'
-        $msbuildArguments = @(
-          "`"$convertedVcxproj`"",
-          '/nologo',
-          '/m:1',
-          '/t:ClCompile',
-          '/p:Configuration=Release',
-          '/p:Platform=Win32',
-          '/p:PlatformToolset=v140',
-          '/p:PreferredToolArchitecture=x64',
-          "/p:CLToolPath=$exactBin",
-          '/p:CLToolExe=cl.exe',
-          "/p:IntDir=$intermediate\",
-          '/p:TrackFileAccess=false',
-          '/v:diag',
-          '/fl',
-          "/flp:logfile=$msbuildDiagnostic;verbosity=diagnostic"
-        )
-        [System.IO.File]::WriteAllLines((Join-Path $variant 'msbuild.args.txt'), $msbuildArguments, [System.Text.Encoding]::ASCII)
-        $msbuildProcess = Start-Process -FilePath $msbuild -ArgumentList $msbuildArguments `
-          -WorkingDirectory (Split-Path -Parent $convertedVcxproj) -NoNewWindow -Wait -PassThru `
-          -RedirectStandardOutput $msbuildStdout -RedirectStandardError $msbuildStderr
-        $msbuildProcess.ExitCode | Set-Content -LiteralPath (Join-Path $variant 'msbuild.exit') -Encoding ASCII
-        if ($msbuildProcess.ExitCode -ne 0) {
-          Get-Content -LiteralPath $msbuildStdout, $msbuildStderr | Select-Object -Last 200 | Write-Host
-          throw "$label converted vcproj descriptor compile failed: $($msbuildProcess.ExitCode)"
-        }
+      $archive = Join-Path $variant 'libprotobuf.lib'
+      Copy-Item -LiteralPath $builtArchive -Destination $archive
 
-        $objectCandidates = @(Get-ChildItem -LiteralPath $intermediate -Recurse -File -Filter 'descriptor.obj')
-        if ($objectCandidates.Count -ne 1) {
-          throw "$label expected one converted-project descriptor.obj, found $($objectCandidates.Count)"
-        }
-        $object = Join-Path $variant 'descriptor.obj'
-        Copy-Item -LiteralPath $objectCandidates[0].FullName -Destination $object
-        if ((Get-Item -LiteralPath $object).Length -le 0) { throw "$label descriptor object is empty" }
-
-        $compile3 = Join-Path $variant 'compile3.json'
-        $compile3Stderr = Join-Path $variant 'compile3.stderr.txt'
-        $python = (Get-Command 'python.exe' -ErrorAction Stop).Source
-        $parseProcess = Start-Process -FilePath $python -ArgumentList @("`"$(Join-Path $buildRoot 'parse_compile3.py')`"", "`"$object`"") `
+      $python = (Get-Command 'python.exe' -ErrorAction Stop).Source
+      $compile3Rows = @()
+      foreach ($object in @($objects | Sort-Object Name)) {
+        $compile3 = Join-Path $work "$($object.BaseName)-compile3.json"
+        $compile3Stderr = Join-Path $work "$($object.BaseName)-compile3.stderr.txt"
+        $parseProcess = Start-Process -FilePath $python -ArgumentList @("`"$(Join-Path $buildRoot 'parse_compile3.py')`"", "`"$($object.FullName)`"") `
           -NoNewWindow -Wait -PassThru -RedirectStandardOutput $compile3 -RedirectStandardError $compile3Stderr
         if ($parseProcess.ExitCode -ne 0) {
           Get-Content -LiteralPath $compile3, $compile3Stderr | Write-Host
-          throw "$label S_COMPILE3 parse failed: $($parseProcess.ExitCode)"
+          throw "$label S_COMPILE3 parse failed for $($object.Name): $($parseProcess.ExitCode)"
         }
-        $compileRows = @(Get-Content -LiteralPath $compile3 -Raw | ConvertFrom-Json)
-        if ($compileRows.Count -ne 1 -or $compileRows[0].frontend -ne '19.0.24215.1' -or $compileRows[0].backend -ne '19.0.24215.1') {
-          throw "$label S_COMPILE3 mismatch"
+        $rows = @(Get-Content -LiteralPath $compile3 -Raw | ConvertFrom-Json)
+        if ($rows.Count -ne 1 -or $rows[0].frontend -ne '19.0.24215.1' -or $rows[0].backend -ne '19.0.24215.1') {
+          throw "$label S_COMPILE3 mismatch for $($object.Name)"
         }
-
-        $compilerFiles = foreach ($name in @('cl.exe', 'c1.dll', 'c1xx.dll', 'c2.dll')) {
-          $path = Join-Path $exactBin $name
-          [pscustomobject]@{ name = $name; size = (Get-Item -LiteralPath $path).Length; sha256 = Get-Sha256 $path }
+        $compile3Rows += [pscustomobject]@{
+          member = $object.Name
+          size = $object.Length
+          sha256 = Get-Sha256 $object.FullName
+          frontend = $rows[0].frontend
+          backend = $rows[0].backend
+          machine = $rows[0].machine
+          version_name = $rows[0].version_name
         }
-        [pscustomobject]@{
-          label = $label
-          source_kind = $sourceKind
-          source_descriptor_sha256 = Get-Sha256 (Join-Path $sourceRoot 'src\google\protobuf\descriptor.cc')
-          source_header_sha256 = $activeHeaderHashes
-          source_root = $sourceRoot
-          observed_public_object_root = 'C:\Users\mreid\Desktop\protobuf-2.6.1\vsprojects\Release'
-          runtime_library = 'MultiThreaded'
-          valve_source_commit = $env:VALVE_SOURCE_COMMIT
-          banner_version = $compilerIdentity.version
-          target = $compilerIdentity.target
-          source_vcproj_sha256 = Get-Sha256 $originalVcproj
-          converted_full_vcxproj_sha256 = $convertedHash
-          descriptor_only_vcxproj_sha256 = $reducedHash
-          converted_compile_items = $compileNodes.Count
-          retained_compile_items = $descriptorNodes.Count
-          compatibility_defines = @('_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS')
-          devenv_path = $devenv
-          devenv_sha256 = Get-Sha256 $devenv
-          msbuild_path = $msbuild
-          msbuild_sha256 = Get-Sha256 $msbuild
-          object_size = (Get-Item -LiteralPath $object).Length
-          object_sha256 = Get-Sha256 $object
-          compiler_files = @($compilerFiles)
-          compile3 = @($compileRows)
-        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $variant 'identity.json') -Encoding UTF8
       }
+      @($compile3Rows) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $variant 'compile3-all.json') -Encoding UTF8
+      @($objects | Sort-Object Name | ForEach-Object { "$($_.Name)`t$($_.Length)`t$(Get-Sha256 $_.FullName)" }) |
+        Set-Content -LiteralPath (Join-Path $variant 'object-manifest.tsv') -Encoding ASCII
 
-      Build-ConvertedDescriptor 'public-layout-converted-hostx64-24215-stock-mt' 'stock'
-      foreach ($name in @('repeated_field.h', 'wire_format_lite_inl.h')) {
-        Copy-Item -LiteralPath (Join-Path $valveHeaderRoot $name) -Destination (Join-Path $sourceRoot "src\google\protobuf\$name") -Force
+      $projectDirectory = Split-Path -Parent $convertedVcxproj
+      $compileItemRows = @()
+      for ($index = 0; $index -lt $compileNodes.Count; $index++) {
+        $sourcePath = (Get-Item -LiteralPath (Join-Path $projectDirectory $compileNodes[$index].Include)).FullName
+        $compileItemRows += "$($index + 1)`t$($compileNodes[$index].Include)`t$((Get-Item -LiteralPath $sourcePath).Length)`t$(Get-Sha256 $sourcePath)"
       }
-      Build-ConvertedDescriptor 'public-layout-converted-hostx64-24215-valve-mt' 'valve'
+      [System.IO.File]::WriteAllLines((Join-Path $variant 'project-compile-items.tsv'), $compileItemRows, [System.Text.Encoding]::ASCII)
+
+      $sourcePrefix = $sourceRoot.TrimEnd('\') + '\'
+      $sourceRows = @(Get-ChildItem -LiteralPath (Join-Path $sourceRoot 'src') -Recurse -File | Sort-Object FullName | ForEach-Object {
+        "$($_.FullName.Substring($sourcePrefix.Length))`t$($_.Length)`t$(Get-Sha256 $_.FullName)"
+      })
+      [System.IO.File]::WriteAllLines((Join-Path $variant 'source-tree-manifest.tsv'), $sourceRows, [System.Text.Encoding]::ASCII)
+
+      $compilerFiles = foreach ($name in @('cl.exe', 'c1.dll', 'c1xx.dll', 'c2.dll', 'link.exe', 'lib.exe')) {
+        $path = Join-Path $exactBin $name
+        [pscustomobject]@{ name = $name; size = (Get-Item -LiteralPath $path).Length; sha256 = Get-Sha256 $path }
+      }
+      [pscustomobject]@{
+        label = $label
+        source_kind = 'Valve public libprotobuf closure: pinned upstream 2.6.1 plus two hash-pinned Valve headers'
+        source_root = $sourceRoot
+        source_descriptor_sha256 = Get-Sha256 (Join-Path $sourceRoot 'src\google\protobuf\descriptor.cc')
+        source_header_sha256 = @{
+          'repeated_field.h' = Get-Sha256 (Join-Path $sourceRoot 'src\google\protobuf\repeated_field.h')
+          'wire_format_lite_inl.h' = Get-Sha256 (Join-Path $sourceRoot 'src\google\protobuf\wire_format_lite_inl.h')
+        }
+        valve_source_commit = $env:VALVE_SOURCE_COMMIT
+        runtime_library = 'MultiThreaded'
+        compatibility_defines = @('_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS')
+        source_root_matches_public_object = $true
+        banner_version = $compilerIdentity.version
+        target = $compilerIdentity.target
+        source_vcproj_sha256 = Get-Sha256 $originalVcproj
+        converted_full_vcxproj_sha256 = $convertedHash
+        static_runtime_full_vcxproj_sha256 = $staticFullHash
+        converted_compile_items = $compileNodes.Count
+        archive_member_count = $actualArchiveOrder.Count
+        archive_member_order = @($actualArchiveOrder)
+        archive_size = (Get-Item -LiteralPath $archive).Length
+        archive_sha256 = Get-Sha256 $archive
+        compile3_verified_members = $compile3Rows.Count
+        compiler_files = @($compilerFiles)
+        devenv_path = $devenv
+        devenv_sha256 = Get-Sha256 $devenv
+        msbuild_path = $msbuild
+        msbuild_sha256 = Get-Sha256 $msbuild
+      } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $variant 'identity.json') -Encoding UTF8
 
       Get-ChildItem -LiteralPath $output -Recurse -File -Filter '*.pdb' | Remove-Item -Force
 
@@ -504,5 +596,5 @@ build_script:
 
 artifacts:
   - path: probe-output
-    name: converted-vcproj-protobuf-probe
+    name: exact24215-full-valve-protobuf
     type: zip
