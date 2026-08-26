@@ -1,4 +1,4 @@
-version: "public24245-project-metadata-replay-{build}"
+version: "exact24215-public-project-replay-{build}"
 
 image: Visual Studio 2015
 clone_depth: 1
@@ -334,14 +334,8 @@ build_script:
       $msbuild = Join-Path ${env:ProgramFiles(x86)} 'MSBuild\14.0\Bin\MSBuild.exe'
       if (-not (Test-Path -LiteralPath $msbuild -PathType Leaf)) { throw "MSBuild 14 missing: $msbuild" }
 
-      $currentCompilerGates = @{
-        'cl.exe'   = 'ca4dc6a4894a487457c6961aa440f8b782ab7047091c445a5df7925b4444761d'
-        'c1.dll'   = '8b3cb95cbb84be89c33cd4808d77074ab273fd04d0266bdc30b5f1db60ae815f'
-        'c1xx.dll' = '96cae58710acd25bc6eed1b8ceab4f7fdc86a20a56d274f07f9f297ae8210d23'
-        'c2.dll'   = '2ea83422a930a9b647ad7b4df910f9d43b6e7725dc3297193207c65a0d49f5d5'
-      }
-      foreach ($name in $currentCompilerGates.Keys) {
-        Assert-File (Join-Path $currentHostX64Bin $name) $currentCompilerGates[$name]
+      foreach ($name in @('cl.exe', 'c1.dll', 'c1xx.dll', 'c2.dll')) {
+        Assert-File (Join-Path $exactBin $name) $exactFiles[$name][1]
       }
 
       $stockHeaderGates = @{
@@ -373,9 +367,9 @@ build_script:
         }
         New-Item -ItemType Directory -Force -Path $variant, $intermediate | Out-Null
 
-        $compilerIdentity = Capture-Banner $label (Join-Path $currentHostX64Bin 'cl.exe')
+        $compilerIdentity = Capture-Banner $label (Join-Path $exactBin 'cl.exe')
         $normalizedBanner = (($compilerIdentity.version.Split('.') | ForEach-Object { [int]$_ }) -join '.')
-        if ($normalizedBanner -ne '19.0.24241.7' -or $compilerIdentity.target -ne 'x86') {
+        if ($normalizedBanner -ne '19.0.24215.1' -or $compilerIdentity.target -ne 'x86') {
           throw "$label unexpected compiler identity: $($compilerIdentity.version) for $($compilerIdentity.target)"
         }
 
@@ -399,7 +393,7 @@ build_script:
           '/p:Platform=Win32',
           '/p:PlatformToolset=v140',
           '/p:PreferredToolArchitecture=x64',
-          "/p:CLToolPath=$currentHostX64Bin",
+          "/p:CLToolPath=$exactBin",
           '/p:CLToolExe=cl.exe',
           "/p:IntDir=$intermediate\",
           '/p:TrackFileAccess=false',
@@ -435,12 +429,12 @@ build_script:
           throw "$label S_COMPILE3 parse failed: $($parseProcess.ExitCode)"
         }
         $compileRows = @(Get-Content -LiteralPath $compile3 -Raw | ConvertFrom-Json)
-        if ($compileRows.Count -ne 1 -or $compileRows[0].frontend -ne '19.0.24241.7' -or $compileRows[0].backend -ne '19.0.24241.7') {
+        if ($compileRows.Count -ne 1 -or $compileRows[0].frontend -ne '19.0.24215.1' -or $compileRows[0].backend -ne '19.0.24215.1') {
           throw "$label S_COMPILE3 mismatch"
         }
 
         $compilerFiles = foreach ($name in @('cl.exe', 'c1.dll', 'c1xx.dll', 'c2.dll')) {
-          $path = Join-Path $currentHostX64Bin $name
+          $path = Join-Path $exactBin $name
           [pscustomobject]@{ name = $name; size = (Get-Item -LiteralPath $path).Length; sha256 = Get-Sha256 $path }
         }
         [pscustomobject]@{
@@ -471,11 +465,11 @@ build_script:
         } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $variant 'identity.json') -Encoding UTF8
       }
 
-      Build-ConvertedDescriptor 'public-layout-converted-hostx64-24241-stock-mt' 'stock'
+      Build-ConvertedDescriptor 'public-layout-converted-hostx64-24215-stock-mt' 'stock'
       foreach ($name in @('repeated_field.h', 'wire_format_lite_inl.h')) {
         Copy-Item -LiteralPath (Join-Path $valveHeaderRoot $name) -Destination (Join-Path $sourceRoot "src\google\protobuf\$name") -Force
       }
-      Build-ConvertedDescriptor 'public-layout-converted-hostx64-24241-valve-mt' 'valve'
+      Build-ConvertedDescriptor 'public-layout-converted-hostx64-24215-valve-mt' 'valve'
 
       Get-ChildItem -LiteralPath $output -Recurse -File -Filter '*.pdb' | Remove-Item -Force
 
