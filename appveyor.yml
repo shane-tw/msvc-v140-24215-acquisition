@@ -1,4 +1,4 @@
-version: "converted-vcproj-24241-dual-source-{build}"
+version: "public24245-project-metadata-replay-{build}"
 
 image: Visual Studio 2015
 clone_depth: 1
@@ -113,7 +113,8 @@ build_script:
         throw "protobuf archive size mismatch"
       }
       Assert-File $sourceArchive $env:PROTOBUF_SHA256
-      $sourceExtract = Join-Path $work 'source'
+      # Replay the exact source root embedded in every public 24245 member.
+      $sourceExtract = 'C:\Users\mreid\Desktop'
       New-Item -ItemType Directory -Force -Path $sourceExtract | Out-Null
       & $sevenZip x -y "-o$sourceExtract" $sourceArchive | Out-File (Join-Path $output 'protobuf-gzip-extract.log') -Encoding ASCII
       if ($LASTEXITCODE -ne 0) { throw "protobuf gzip extraction failed: $LASTEXITCODE" }
@@ -309,6 +310,13 @@ build_script:
       foreach ($node in $compileNodes) {
         if ($node -ne $descriptorNodes[0]) { [void]$node.ParentNode.RemoveChild($node) }
       }
+      $releaseRuntime = $projectXml.SelectSingleNode("//m:ItemDefinitionGroup[@Condition=`"'`$(Configuration)|`$(Platform)'=='Release|Win32'`"]//m:ClCompile/m:RuntimeLibrary", $namespace)
+      if ($null -eq $releaseRuntime -or $releaseRuntime.InnerText -ne 'MultiThreadedDLL') {
+        throw "converted project Release runtime was not the expected MultiThreadedDLL default"
+      }
+      # The public object's directives prove this local project override even
+      # though the committed upstream vcproj still names the DLL runtime.
+      $releaseRuntime.InnerText = 'MultiThreaded'
       if ($null -ne $descriptorNodes[0].SelectSingleNode('m:PreprocessorDefinitions', $namespace)) {
         throw "descriptor.cc unexpectedly has per-item preprocessor definitions"
       }
@@ -321,7 +329,7 @@ build_script:
       $xmlWriter = [System.Xml.XmlWriter]::Create($convertedVcxproj, $xmlSettings)
       try { $projectXml.Save($xmlWriter) } finally { $xmlWriter.Dispose() }
       $reducedHash = Get-Sha256 $convertedVcxproj
-      Copy-Item -LiteralPath $convertedVcxproj -Destination (Join-Path $projectEvidence 'libprotobuf.descriptor-only.vcxproj')
+      Copy-Item -LiteralPath $convertedVcxproj -Destination (Join-Path $projectEvidence 'libprotobuf.static-runtime-descriptor-only.vcxproj')
 
       $msbuild = Join-Path ${env:ProgramFiles(x86)} 'MSBuild\14.0\Bin\MSBuild.exe'
       if (-not (Test-Path -LiteralPath $msbuild -PathType Leaf)) { throw "MSBuild 14 missing: $msbuild" }
@@ -355,7 +363,14 @@ build_script:
 
       function Build-ConvertedDescriptor([string]$label, [string]$sourceKind) {
         $variant = Join-Path $output $label
-        $intermediate = Join-Path $variant 'obj'
+        $intermediate = Join-Path $sourceRoot 'vsprojects\Release'
+        if (Test-Path -LiteralPath $intermediate) {
+          $expectedIntermediate = (Join-Path $sourceRoot 'vsprojects\Release').ToLowerInvariant()
+          if ($intermediate.ToLowerInvariant() -ne $expectedIntermediate) {
+            throw "refusing to clean unexpected intermediate directory: $intermediate"
+          }
+          Remove-Item -LiteralPath $intermediate -Recurse -Force
+        }
         New-Item -ItemType Directory -Force -Path $variant, $intermediate | Out-Null
 
         $compilerIdentity = Capture-Banner $label (Join-Path $currentHostX64Bin 'cl.exe')
@@ -433,6 +448,9 @@ build_script:
           source_kind = $sourceKind
           source_descriptor_sha256 = Get-Sha256 (Join-Path $sourceRoot 'src\google\protobuf\descriptor.cc')
           source_header_sha256 = $activeHeaderHashes
+          source_root = $sourceRoot
+          observed_public_object_root = 'C:\Users\mreid\Desktop\protobuf-2.6.1\vsprojects\Release'
+          runtime_library = 'MultiThreaded'
           valve_source_commit = $env:VALVE_SOURCE_COMMIT
           banner_version = $compilerIdentity.version
           target = $compilerIdentity.target
@@ -453,11 +471,11 @@ build_script:
         } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $variant 'identity.json') -Encoding UTF8
       }
 
-      Build-ConvertedDescriptor 'converted-vcproj-release-hostx64-24241-stock' 'stock'
+      Build-ConvertedDescriptor 'public-layout-converted-hostx64-24241-stock-mt' 'stock'
       foreach ($name in @('repeated_field.h', 'wire_format_lite_inl.h')) {
         Copy-Item -LiteralPath (Join-Path $valveHeaderRoot $name) -Destination (Join-Path $sourceRoot "src\google\protobuf\$name") -Force
       }
-      Build-ConvertedDescriptor 'converted-vcproj-release-hostx64-24241-valve' 'valve'
+      Build-ConvertedDescriptor 'public-layout-converted-hostx64-24241-valve-mt' 'valve'
 
       Get-ChildItem -LiteralPath $output -Recurse -File -Filter '*.pdb' | Remove-Item -Force
 
@@ -469,6 +487,9 @@ build_script:
         protobuf_url = $env:PROTOBUF_URL
         protobuf_size = (Get-Item -LiteralPath $sourceArchive).Length
         protobuf_sha256 = Get-Sha256 $sourceArchive
+        source_root = $sourceRoot
+        observed_public_object_root = 'C:\Users\mreid\Desktop\protobuf-2.6.1\vsprojects\Release'
+        observed_public_runtime = 'MultiThreaded'
         valve_source_commit = $env:VALVE_SOURCE_COMMIT
         valve_source_repository = 'https://github.com/ValveSoftware/source-sdk-2013'
         msp_path = $msp.FullName
