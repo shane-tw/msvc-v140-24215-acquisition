@@ -317,6 +317,12 @@ build_script:
       foreach ($node in $compileNodes) {
         if ($node -ne $descriptorNodes[0]) { [void]$node.ParentNode.RemoveChild($node) }
       }
+      if ($null -ne $descriptorNodes[0].SelectSingleNode('m:PreprocessorDefinitions', $namespace)) {
+        throw "descriptor.cc unexpectedly has per-item preprocessor definitions"
+      }
+      $compatibilityDefines = $projectXml.CreateElement('PreprocessorDefinitions', 'http://schemas.microsoft.com/developer/msbuild/2003')
+      $compatibilityDefines.InnerText = '_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS;%(PreprocessorDefinitions)'
+      [void]$descriptorNodes[0].AppendChild($compatibilityDefines)
       $xmlSettings = New-Object System.Xml.XmlWriterSettings
       $xmlSettings.Encoding = New-Object System.Text.UTF8Encoding($false)
       $xmlSettings.Indent = $true
@@ -392,6 +398,7 @@ build_script:
         descriptor_only_vcxproj_sha256 = $reducedHash
         converted_compile_items = $compileNodes.Count
         retained_compile_items = $descriptorNodes.Count
+        compatibility_defines = @('_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS')
         devenv_path = $devenv
         devenv_sha256 = Get-Sha256 $devenv
         msbuild_path = $msbuild
