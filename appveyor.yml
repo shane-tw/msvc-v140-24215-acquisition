@@ -465,63 +465,47 @@ build_script:
 
       $nativeArchiveSize = (Get-Item -LiteralPath $builtArchive).Length
       $nativeArchiveHash = Get-Sha256 $builtArchive
-      $nativeListStdout = Join-Path $variant 'msbuild-native-lib-list.stdout.txt'
-      $nativeListStderr = Join-Path $variant 'msbuild-native-lib-list.stderr.txt'
+      $nativeListStdout = Join-Path $variant 'lib-list.stdout.txt'
+      $nativeListStderr = Join-Path $variant 'lib-list.stderr.txt'
       $nativeListProcess = Start-Process -FilePath $librarian -ArgumentList @('/nologo', '/list', "`"$builtArchive`"") `
         -NoNewWindow -Wait -PassThru -RedirectStandardOutput $nativeListStdout -RedirectStandardError $nativeListStderr
       if ($nativeListProcess.ExitCode -ne 0) {
         Get-Content -LiteralPath $nativeListStdout, $nativeListStderr | Write-Host
         throw "$label native librarian member listing failed: $($nativeListProcess.ExitCode)"
       }
-      $nativeArchiveOrder = @(Get-Content -LiteralPath $nativeListStdout | Where-Object { $_.Trim().ToLowerInvariant().EndsWith('.obj') } | ForEach-Object { [System.IO.Path]::GetFileName($_.Trim()) })
-      if ($nativeArchiveOrder.Count -ne 34) { throw "$label native archive did not contain 34 members" }
-      [System.IO.File]::WriteAllLines((Join-Path $variant 'msbuild-native-archive-order.txt'), $nativeArchiveOrder, [System.Text.Encoding]::ASCII)
+      $libListOrder = @(Get-Content -LiteralPath $nativeListStdout | Where-Object { $_.Trim().ToLowerInvariant().EndsWith('.obj') } | ForEach-Object { [System.IO.Path]::GetFileName($_.Trim()) })
+      if ($libListOrder.Count -ne 34) { throw "$label native archive did not contain 34 librarian-listed members" }
+      [System.IO.File]::WriteAllLines((Join-Path $variant 'lib-list-order.txt'), $libListOrder, [System.Text.Encoding]::ASCII)
 
-      # VS2015 conversion enumerates the original vcproj items in forward
-      # order, while both the checked Win64 archive and public Win32 witness
-      # preserve the exact reverse order.  Replay that frozen order explicitly.
+      # Preserve the native converted-project librarian output.  MSVC's
+      # `/list` order is not physical archive order, so independently parse
+      # COFF headers and the // long-name table before admission.
       $archive = Join-Path $variant 'libprotobuf.lib'
-      $orderedObjectPaths = @()
-      foreach ($name in $expectedArchiveOrder) {
-        $match = @($objects | Where-Object { $_.Name -ieq $name })
-        if ($match.Count -ne 1) { throw "$label could not resolve ordered object $name" }
-        $orderedObjectPaths += $match[0].FullName
+      Copy-Item -LiteralPath $builtArchive -Destination $archive
+      $archiveParser = Join-Path $buildRoot 'list_coff_archive.py'
+      $physicalOrderJson = Join-Path $variant 'physical-archive-order.json'
+      $physicalOrderStderr = Join-Path $variant 'physical-archive-order.stderr.txt'
+      $python = (Get-Command 'python.exe' -ErrorAction Stop).Source
+      $physicalOrderProcess = Start-Process -FilePath $python -ArgumentList @("`"$archiveParser`"", "`"$archive`"", '--json') `
+        -NoNewWindow -Wait -PassThru -RedirectStandardOutput $physicalOrderJson -RedirectStandardError $physicalOrderStderr
+      if ($physicalOrderProcess.ExitCode -ne 0) {
+        Get-Content -LiteralPath $physicalOrderJson, $physicalOrderStderr | Write-Host
+        throw "$label independent physical archive parse failed: $($physicalOrderProcess.ExitCode)"
       }
-      $orderedRsp = Join-Path $variant 'ordered-lib.rsp'
-      $orderedRspLines = @('/nologo', "/out:`"$archive`"") + @($orderedObjectPaths | ForEach-Object { "`"$_`"" })
-      [System.IO.File]::WriteAllLines($orderedRsp, $orderedRspLines, [System.Text.Encoding]::ASCII)
-      $orderedLibStdout = Join-Path $variant 'ordered-lib.stdout.txt'
-      $orderedLibStderr = Join-Path $variant 'ordered-lib.stderr.txt'
-      & $librarian ("@" + $orderedRsp) 1> $orderedLibStdout 2> $orderedLibStderr
-      if ($LASTEXITCODE -ne 0) {
-        Get-Content -LiteralPath $orderedLibStdout, $orderedLibStderr | Write-Host
-        throw "$label ordered librarian build failed: $LASTEXITCODE"
-      }
-      if (-not (Test-Path -LiteralPath $archive -PathType Leaf) -or (Get-Item -LiteralPath $archive).Length -le 0) {
-        throw "$label ordered archive missing or empty"
-      }
-
-      $listStdout = Join-Path $variant 'lib-list.stdout.txt'
-      $listStderr = Join-Path $variant 'lib-list.stderr.txt'
-      $listProcess = Start-Process -FilePath $librarian -ArgumentList @('/nologo', '/list', "`"$archive`"") `
-        -NoNewWindow -Wait -PassThru -RedirectStandardOutput $listStdout -RedirectStandardError $listStderr
-      if ($listProcess.ExitCode -ne 0) {
-        Get-Content -LiteralPath $listStdout, $listStderr | Write-Host
-        throw "$label librarian member listing failed: $($listProcess.ExitCode)"
-      }
-      $actualArchiveOrder = @(Get-Content -LiteralPath $listStdout | Where-Object { $_.Trim().ToLowerInvariant().EndsWith('.obj') } | ForEach-Object { [System.IO.Path]::GetFileName($_.Trim()) })
+      $physicalOrder = Get-Content -LiteralPath $physicalOrderJson -Raw | ConvertFrom-Json
+      $actualArchiveOrder = @($physicalOrder.members | ForEach-Object { $_.basename })
       if ($actualArchiveOrder.Count -ne $expectedArchiveOrder.Count) {
-        throw "$label archive member count mismatch: expected=$($expectedArchiveOrder.Count) actual=$($actualArchiveOrder.Count)"
+        throw "$label physical archive member count mismatch: expected=$($expectedArchiveOrder.Count) actual=$($actualArchiveOrder.Count)"
       }
       for ($index = 0; $index -lt $expectedArchiveOrder.Count; $index++) {
         if ($actualArchiveOrder[$index].ToLowerInvariant() -ne $expectedArchiveOrder[$index].ToLowerInvariant()) {
-          throw "$label archive order mismatch at $index expected=$($expectedArchiveOrder[$index]) actual=$($actualArchiveOrder[$index])"
+          throw "$label physical archive order mismatch at $index expected=$($expectedArchiveOrder[$index]) actual=$($actualArchiveOrder[$index])"
         }
       }
       [System.IO.File]::WriteAllLines((Join-Path $variant 'expected-archive-order.txt'), $expectedArchiveOrder, [System.Text.Encoding]::ASCII)
       [System.IO.File]::WriteAllLines((Join-Path $variant 'actual-archive-order.txt'), $actualArchiveOrder, [System.Text.Encoding]::ASCII)
+      Copy-Item -LiteralPath $archiveParser -Destination (Join-Path $projectEvidence 'list_coff_archive.py')
 
-      $python = (Get-Command 'python.exe' -ErrorAction Stop).Source
       $compile3Rows = @()
       foreach ($object in @($objects | Sort-Object Name)) {
         $compile3 = Join-Path $work "$($object.BaseName)-compile3.json"
@@ -593,8 +577,9 @@ build_script:
         archive_sha256 = Get-Sha256 $archive
         msbuild_native_archive_size = $nativeArchiveSize
         msbuild_native_archive_sha256 = $nativeArchiveHash
-        msbuild_native_archive_order = @($nativeArchiveOrder)
-        ordered_archive_replay = $true
+        lib_list_order = @($libListOrder)
+        physical_archive_parser_sha256 = Get-Sha256 $archiveParser
+        native_archive_preserved = $true
         compile3_verified_members = $compile3Rows.Count
         compiler_files = @($compilerFiles)
         devenv_path = $devenv
