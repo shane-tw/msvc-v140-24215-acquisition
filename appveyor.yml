@@ -1,4 +1,4 @@
-version: "v140-msp-probe-{build}"
+version: "mfc-24213-capture-{build}"
 
 image: Visual Studio 2015
 clone_depth: 1
@@ -6,11 +6,12 @@ skip_tags: true
 test: off
 deploy: off
 
+branches:
+  only:
+    - mfc-24213-capture
+
 environment:
-  EXPECTED_MSVC_BANNER: 19.00.24215.1
-  EXPECTED_VC_VSU3_MSP_SHA1: 0635238754D5A8C38FE9BAF41296C1E0C8DA49B1
-  EXPECTED_VC_VSU3_MSP_SIZE: 75481088
-  APPVEYOR_ARTIFACT_UPLOAD_TIMEOUT: 600
+  APPVEYOR_ARTIFACT_UPLOAD_TIMEOUT: 1200
 
 build_script:
   - ps: |
@@ -20,191 +21,53 @@ build_script:
       $buildRoot = $env:APPVEYOR_BUILD_FOLDER
       $captureRoot = Join-Path $buildRoot 'capture-root'
       $metadataRoot = Join-Path $buildRoot 'capture-metadata'
-      $vcRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio 14.0\VC'
-      $packageCacheRoot = 'C:\ProgramData\Package Cache'
+      $cacheRoot = 'C:\ProgramData\Package Cache'
+      $cachePrefix = $cacheRoot.TrimEnd('\') + '\'
       New-Item -ItemType Directory -Force -Path $captureRoot, $metadataRoot | Out-Null
 
-      function Get-CompilerIdentity {
-        param(
-          [Parameter(Mandatory = $true)][string]$Compiler,
-          [Parameter(Mandatory = $true)][string]$Label
-        )
-
-        if (-not (Test-Path -LiteralPath $Compiler -PathType Leaf)) {
-          return [pscustomobject]@{
-            label = $Label; path = $Compiler; status = 'missing'; error = 'compiler path absent'
-            banner_version = $null; target = $null; expected_version = $env:EXPECTED_MSVC_BANNER
-            expected_version_match = $false; size = $null; sha256 = $null
-            file_version = $null; product_version = $null; signature_status = $null; signer = $null
-          }
-        }
-
-        $stdoutPath = Join-Path $metadataRoot "$Label-cl-stdout.txt"
-        $stderrPath = Join-Path $metadataRoot "$Label-cl-stderr.txt"
-        try {
-          $process = Start-Process -FilePath $Compiler -ArgumentList '/?' -NoNewWindow -Wait -PassThru `
-            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
-          $banner = ((Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) + "`n" +
-            (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue)).Trim()
-          $banner | Set-Content -LiteralPath (Join-Path $metadataRoot "$Label-banner.txt") -Encoding ASCII
-          $match = [regex]::Match($banner, 'Version\s+([0-9.]+)\s+for\s+([^\s]+)')
-          $item = Get-Item -LiteralPath $Compiler
-          $signature = Get-AuthenticodeSignature -LiteralPath $Compiler
-          return [pscustomobject]@{
-            label = $Label; path = $Compiler; status = if ($match.Success) { 'parsed' } else { 'unparsed' }
-            error = if ($match.Success) { $null } else { 'compiler banner regex did not match' }
-            exit_code = $process.ExitCode
-            banner_version = if ($match.Success) { $match.Groups[1].Value } else { $null }
-            target = if ($match.Success) { $match.Groups[2].Value } else { $null }
-            expected_version = $env:EXPECTED_MSVC_BANNER
-            expected_version_match = ($match.Success -and $match.Groups[1].Value -eq $env:EXPECTED_MSVC_BANNER)
-            size = $item.Length
-            sha256 = (Get-FileHash -LiteralPath $Compiler -Algorithm SHA256).Hash.ToLowerInvariant()
-            file_version = $item.VersionInfo.FileVersion
-            product_version = $item.VersionInfo.ProductVersion
-            signature_status = $signature.Status.ToString()
-            signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { $null }
-          }
-        }
-        catch {
-          return [pscustomobject]@{
-            label = $Label; path = $Compiler; status = 'error'; error = $_.Exception.Message
-            banner_version = $null; target = $null; expected_version = $env:EXPECTED_MSVC_BANNER
-            expected_version_match = $false; size = $null; sha256 = $null
-            file_version = $null; product_version = $null; signature_status = $null; signer = $null
-          }
-        }
-      }
-
-      $x86Cl = Join-Path $vcRoot 'bin\cl.exe'
-      $amd64Cl = Join-Path $vcRoot 'bin\amd64\cl.exe'
-      if (-not (Test-Path -LiteralPath $amd64Cl -PathType Leaf)) {
-        $amd64Cl = Join-Path $vcRoot 'bin\x86_amd64\cl.exe'
-      }
-      $compilerIdentities = @(
-        Get-CompilerIdentity -Compiler $x86Cl -Label 'x86'
-        Get-CompilerIdentity -Compiler $amd64Cl -Label 'amd64'
+      # KB3165756 ships VC_MFC.X86/X64/MBCS as full MSI packages at 14.0.24213; Burn caches
+      # them under {ProductCode}v14.0.24213 with their external cabinets.
+      $productCodes = @(
+        '{5D0FA3E6-0A32-37C1-96CD-4E9DFF785FC0}'
+        '{45BA717B-9F10-3553-B582-2D1156747046}'
+        '{C1C8E6C3-F739-36C3-A02B-1DED2EE23766}'
       )
-      $compilerIdentities | ConvertTo-Json -Depth 5 |
-        Set-Content -LiteralPath (Join-Path $metadataRoot 'compiler-identities.json') -Encoding UTF8
+      Get-ChildItem -LiteralPath $cacheRoot -Force -Directory | Sort-Object Name |
+        ForEach-Object { $_.Name } | Set-Content -LiteralPath (Join-Path $metadataRoot 'package-cache-dirs.txt') -Encoding ASCII
+      Write-Host "top-level cache directories: $(@(Get-ChildItem -LiteralPath $cacheRoot -Force -Directory).Count)"
 
-      @(
-        "os_version=$([System.Environment]::OSVersion.VersionString)",
-        "is_64_bit_os=$([System.Environment]::Is64BitOperatingSystem)",
-        "powershell_version=$($PSVersionTable.PSVersion.ToString())"
-      ) | Set-Content -LiteralPath (Join-Path $metadataRoot 'worker-os.txt') -Encoding ASCII
-      @(
-        "APPVEYOR_BUILD_WORKER_IMAGE=$env:APPVEYOR_BUILD_WORKER_IMAGE",
-        "APPVEYOR_BUILD_ID=$env:APPVEYOR_BUILD_ID",
-        "APPVEYOR_JOB_ID=$env:APPVEYOR_JOB_ID",
-        "APPVEYOR_BUILD_VERSION=$env:APPVEYOR_BUILD_VERSION",
-        "APPVEYOR_REPO_COMMIT=$env:APPVEYOR_REPO_COMMIT"
-      ) | Set-Content -LiteralPath (Join-Path $metadataRoot 'appveyor-environment.txt') -Encoding ASCII
+      $selectedDirs = @(Get-ChildItem -LiteralPath $cacheRoot -Force -Directory | Where-Object {
+        $name = $_.Name
+        ($name -match '(?<![0-9])24213(?![0-9])') -or (@($productCodes | Where-Object { $name.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
+      })
+      Write-Host "directories matched by name: $($selectedDirs.Count)"
+      $mfcFiles = @(Get-ChildItem -LiteralPath $cacheRoot -Recurse -Force -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName.Substring($cachePrefix.Length) -match '(?i)VC_MFC' })
+      Write-Host "files under VC_MFC paths: $($mfcFiles.Count)"
 
-      function Copy-PackageCacheFile {
-        param([Parameter(Mandatory = $true)][string]$Source)
-        $cachePrefix = $packageCacheRoot.TrimEnd('\') + '\'
-        if (-not $Source.StartsWith($cachePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-          throw "Package Cache path escaped its root: $Source"
-        }
-        $relative = $Source.Substring($cachePrefix.Length)
+      $files = @(@($selectedDirs | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Recurse -Force -File }) + $mfcFiles |
+        Sort-Object FullName -Unique)
+      $rows = foreach ($file in $files) {
+        $relative = $file.FullName.Substring($cachePrefix.Length)
         $destination = Join-Path (Join-Path $captureRoot 'PackageCache') $relative
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-        Copy-Item -LiteralPath $Source -Destination $destination -Force
+        Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+        $sha1 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA1).Hash
+        Write-Host "captured $relative $($file.Length) $sha1"
+        "$relative`t$($file.Length)`t$sha1`t$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
       }
-
-      $expectedSha1 = $env:EXPECTED_VC_VSU3_MSP_SHA1.ToUpperInvariant()
-      $expectedSize = [int64]$env:EXPECTED_VC_VSU3_MSP_SIZE
-      $mspRows = New-Object 'System.Collections.Generic.List[object]'
-      $selectedPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-      $scanComplete = $false
-      $scanError = $null
-      $discoveredCount = 0
-      $hashedCount = 0
-      $selectedBytes = [int64]0
-      $selectedByteCap = [int64](256MB)
-      if (Test-Path -LiteralPath $packageCacheRoot -PathType Container) {
-        try {
-          $mspFiles = @(Get-ChildItem -LiteralPath $packageCacheRoot -Recurse -Force -File -Filter '*.msp' -ErrorAction Stop |
-            Sort-Object FullName)
-          $discoveredCount = $mspFiles.Count
-          foreach ($mspFile in $mspFiles) {
-            $sha1 = (Get-FileHash -LiteralPath $mspFile.FullName -Algorithm SHA1).Hash.ToUpperInvariant()
-            $sha256 = (Get-FileHash -LiteralPath $mspFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            $hashedCount++
-            $exactHash = ($sha1 -eq $expectedSha1)
-            $exactSize = ($mspFile.Length -eq $expectedSize)
-            $namedCandidate = ($mspFile.FullName -match '(?i)VC[_-]?VSU3|KB3165756|14[.]0[.](24215|25425)')
-            $selected = ($exactHash -and $exactSize) -or $namedCandidate
-            $copyOmittedByCap = ($selected -and ($selectedBytes + $mspFile.Length -gt $selectedByteCap))
-            $mspRows.Add([pscustomobject]@{
-              path = $mspFile.FullName
-              size = $mspFile.Length
-              sha1 = $sha1
-              sha256 = $sha256
-              expected_sha1_match = $exactHash
-              expected_size_match = $exactSize
-              named_candidate = $namedCandidate
-              selected = $selected
-              copy_omitted_by_cap = $copyOmittedByCap
-            })
-            if ($selected -and -not $copyOmittedByCap) {
-              $selectedBytes += $mspFile.Length
-              [void]$selectedPaths.Add($mspFile.FullName)
-              Copy-PackageCacheFile -Source $mspFile.FullName
-              Get-ChildItem -LiteralPath $mspFile.DirectoryName -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -lt 4MB -and $_.Extension -match '(?i)^\.(xml|json|manifest|txt|ini|rsm)$' } |
-                ForEach-Object {
-                  if ($selectedBytes + $_.Length -le $selectedByteCap) {
-                    $selectedBytes += $_.Length
-                    [void]$selectedPaths.Add($_.FullName)
-                    Copy-PackageCacheFile -Source $_.FullName
-                  }
-                }
-            }
-          }
-          $scanComplete = $true
-        }
-        catch {
-          $scanError = $_.Exception.Message
-        }
+      @($rows) | Set-Content -LiteralPath (Join-Path $metadataRoot 'captured.tsv') -Encoding ASCII
+      "APPVEYOR_BUILD_WORKER_IMAGE=$env:APPVEYOR_BUILD_WORKER_IMAGE", "APPVEYOR_JOB_ID=$env:APPVEYOR_JOB_ID",
+        "APPVEYOR_REPO_COMMIT=$env:APPVEYOR_REPO_COMMIT" |
+        Set-Content -LiteralPath (Join-Path $metadataRoot 'worker.txt') -Encoding ASCII
+      if ($files.Count -eq 0) {
+        'no files captured' | Set-Content -LiteralPath (Join-Path $captureRoot 'EMPTY.txt') -Encoding ASCII
       }
-      $mspRows | ConvertTo-Json -Depth 5 |
-        Set-Content -LiteralPath (Join-Path $metadataRoot 'package-cache-msp.json') -Encoding UTF8
-
-      $exactMatches = @($mspRows | Where-Object { $_.expected_sha1_match -and $_.expected_size_match })
-      $namedMatches = @($mspRows | Where-Object { $_.named_candidate })
-      [pscustomobject]@{
-        expected_sha1 = $expectedSha1
-        expected_size = $expectedSize
-        expected_payload_found = ($exactMatches.Count -gt 0)
-        expected_payload_count = $exactMatches.Count
-        expected_payload_size_valid = ($exactMatches.Count -gt 0 -and @($exactMatches | Where-Object { -not $_.expected_size_match }).Count -eq 0)
-        named_candidate_count = $namedMatches.Count
-        scan_complete = $scanComplete
-        scan_error = $scanError
-        discovered_msp_count = $discoveredCount
-        hashed_msp_count = $hashedCount
-        total_msp_count = $mspRows.Count
-        selected_file_count = $selectedPaths.Count
-        selected_total_bytes = $selectedBytes
-        selected_byte_cap = $selectedByteCap
-        installed_compiler_is_expected = (@($compilerIdentities | Where-Object { -not $_.expected_version_match }).Count -eq 0)
-      } | ConvertTo-Json |
-        Set-Content -LiteralPath (Join-Path $metadataRoot 'RESULT.json') -Encoding UTF8
-
-      $metadataPrefix = $metadataRoot.TrimEnd('\') + '\'
-      Get-ChildItem -LiteralPath $metadataRoot -Recurse -File |
-        Sort-Object FullName |
-        ForEach-Object {
-          $relative = $_.FullName.Substring($metadataPrefix.Length)
-          "$relative`t$($_.Length)`t$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
-        } | Set-Content -LiteralPath (Join-Path $metadataRoot 'SHA256SUMS.tsv') -Encoding ASCII
 
 artifacts:
   - path: capture-metadata
-    name: v140-msp-probe-metadata
+    name: mfc-24213-capture-metadata
     type: zip
   - path: capture-root
-    name: v140-msp-probe-selected-payloads
+    name: mfc-24213-capture-payloads
     type: zip
